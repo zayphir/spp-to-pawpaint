@@ -1,0 +1,18 @@
+SppToPawPaint.exe bundles the following open-source software. Each keeps its
+own licence; see the projects for full texts.
+
+- Python                https://www.python.org          PSF License
+- NumPy                 https://numpy.org               BSD 3-Clause
+- h5py                  https://www.h5py.org            BSD 3-Clause
+- HDF5 (via h5py)       https://www.hdfgroup.org        BSD-style (HDF5 licence)
+- python-lz4 / LZ4      https://github.com/python-lz4   BSD 3-Clause / BSD 2-Clause
+- Pillow                https://python-pillow.org       MIT-CMU (HPND)
+- OpenJPEG (via Pillow) https://www.openjpeg.org        BSD 2-Clause
+- zlib, libpng, libjpeg (via Pillow)                    zlib / libpng / IJG licences
+- Tcl/Tk (tkinter)      https://www.tcl.tk              BSD-style (Tcl/Tk licence)
+- PyInstaller bootloader https://pyinstaller.org        GPL 2.0 with an exception that
+                                                        allows distributing built apps
+
+No Adobe software, code, shaders, .sbsar files or assets are included.
+Substance and Substance 3D Painter are trademarks of Adobe. PawPaint is a
+product of PawWorks. This project is not affiliated with either.

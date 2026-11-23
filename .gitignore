@@ -1,0 +1,17 @@
+# Projects and converted output (they contain models and artwork)
+*.spp
+*.pawpaint
+*(PawPaint import)/
+*(Substance export)/
+
+# Build output
+converter/dist/
+converter/build/
+*.spec
+release/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
