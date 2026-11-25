@@ -52,6 +52,18 @@ def available():
     return True, ctx.info.get("GL_RENDERER", "GPU")
 
 
+SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "swiftshader", "software rasterizer",
+                      "microsoft basic render", "gdi generic")
+
+
+def is_software(renderer):
+    """True for OpenGL drawn by the processor (e.g. Mesa's llvmpipe on a Linux
+    system without a graphics driver). It gives the same result as a graphics
+    card but is slower than the CPU engine, so 'auto' doesn't use it."""
+    r = str(renderer or "").lower()
+    return any(s in r for s in SOFTWARE_RENDERERS)
+
+
 PICK_VS = """
 #version 430
 in vec3 in_pos;

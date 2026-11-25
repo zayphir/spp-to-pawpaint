@@ -105,6 +105,39 @@ bevel, generators and smart masks.
 
 Run it with `--help` for the full list.
 
+### Linux
+
+There is no Linux download yet. Run the converter with Python 3.10 or newer:
+
+```sh
+git clone https://github.com/zayphir/spp-to-pawpaint
+cd spp-to-pawpaint/converter
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python -m spp2pawpaint /path/to/project.spp
+```
+
+- Without a file it opens the same window as on Windows. That needs Tk
+  (`sudo apt install python3-tk` on Ubuntu and Debian). Add `--cli` to stay
+  in the terminal.
+- PawPaint is looked for in Steam's usual folders, including Flatpak and Snap
+  installs and extra Steam libraries. If it isn't found, pass
+  `--pawpaint-dir FOLDER` or set `PAWPAINT_DIR`.
+- When PawPaint runs through Proton it sees your files through drive letters
+  (`Z:` is `/`). The converter writes the folder that way for the plugin and
+  prints it, e.g. `Z:\home\you\My project (PawPaint import)`. Use that form if
+  you paste a folder into the plugin by hand. A Flatpak Steam can only open
+  folders it has been given access to.
+- Engine *Auto* uses the graphics card through OpenGL 4.3. Where only software
+  OpenGL exists (llvmpipe), it uses the CPU engine, which is faster.
+
+**How far this is tested:** the converter gives the same results on Ubuntu
+24.04 as on Windows (CPU engine, and the OpenGL engine on software OpenGL),
+and installing the plugin and the handoff were tried against a made-up Steam
+library. **Not tested yet:** PawPaint itself on Linux picking up a conversion,
+and the OpenGL engine on a real Linux graphics driver. If you try it, please
+open an issue and say how it went.
+
 ## What converts
 
 | Substance | PawPaint | Notes |

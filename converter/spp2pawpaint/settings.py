@@ -40,7 +40,7 @@ class Settings:
 
 
 def _path():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
+    base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return os.path.join(base, "SppToPawPaint", "settings.json")
 
 

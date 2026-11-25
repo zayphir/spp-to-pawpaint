@@ -97,7 +97,10 @@ def run_gui(initial=None):
         try:
             from . import gpu
             ok, name = gpu.available()
-            msgs.put(("gpu", ("GPU: %s" % name) if ok else "GPU: not available (%s), the CPU will be used" % name))
+            if ok and gpu.is_software(name):
+                msgs.put(("gpu", "GPU: only software OpenGL (%s); Auto uses the CPU, which is faster" % name))
+            else:
+                msgs.put(("gpu", ("GPU: %s" % name) if ok else "GPU: not available (%s), the CPU will be used" % name))
         except Exception as e:
             msgs.put(("gpu", "GPU: not available (%s), the CPU will be used" % e))
     threading.Thread(target=detect_gpu, daemon=True).start()
@@ -178,8 +181,9 @@ def run_gui(initial=None):
 
     def copy_path():
         if state["out"]:
+            from . import install
             root.clipboard_clear()
-            root.clipboard_append(state["out"])
+            root.clipboard_append(install.pawpaint_path(install.find_pawpaint(), state["out"]))
     copy_btn.configure(command=copy_path)
 
     def pump():

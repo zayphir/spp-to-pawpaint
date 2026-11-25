@@ -111,7 +111,9 @@ def convert(spp_path, out_dir=None, resolution=None, layers=True, flat=True, bak
     if layers and engine in ("auto", "gpu"):
         from . import gpu
         ok, name = gpu.available()
-        if ok:
+        if ok and engine == "auto" and gpu.is_software(name):
+            log("  engine: CPU (the only OpenGL here is software, %s, which is slower)" % name)
+        elif ok:
             use = "gpu"
             log("  engine: GPU (%s), full detail" % name)
         else:
@@ -253,13 +255,16 @@ def _write_report(out_dir, spp_path, res, entries, warnings):
 
 def _handoff(out_dir, spp_path, entries, pawpaint_dir, log):
     pp_dir = I.find_pawpaint(pawpaint_dir)
+    shown = I.pawpaint_path(pp_dir, out_dir)  # differs when PawPaint runs through Proton
     if pp_dir:
         try:
             I.write_pending(pp_dir, out_dir, spp_path, [e["name"] for e in entries])
             log("PawPaint will offer this conversion in Plugins > Substance Importer.")
         except OSError as e:
             log("Could not leave a note for the PawPaint plugin (%s)." % e)
-    if I.copy_to_clipboard(out_dir):
+    if shown != os.path.abspath(out_dir):
+        log("PawPaint runs through Proton here. Inside PawPaint the folder is: %s" % shown)
+    if I.copy_to_clipboard(shown):
         log("The folder path is also on your clipboard.")
 
 
@@ -267,7 +272,8 @@ def maybe_install_plugin(pawpaint_dir=None, assume_yes=False, log=print, ask=Non
     """Install/update the PawPaint plugin if needed. Returns status text."""
     pp_dir = I.find_pawpaint(pawpaint_dir)
     if not pp_dir:
-        return "PawPaint not found (install it from Steam, or pass --pawpaint-dir)"
+        return ("PawPaint not found (install it from Steam, or give its folder with --pawpaint-dir "
+                "or the PAWPAINT_DIR environment variable)")
     status = I.plugin_status(pp_dir)
     if status == "current":
         return "PawPaint plugin is up to date"
