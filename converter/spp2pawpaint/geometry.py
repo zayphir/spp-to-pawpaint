@@ -123,6 +123,59 @@ class Geometry:
         hit = ok & (u >= -1e-7) & (v >= -1e-7) & (u + v <= 1 + 1e-7) & (t > 0)
         return np.where(hit, t, np.inf)
 
+    def _near_line(self, o, d):
+        """Ids (ascending) of the triangles whose bounding sphere the line
+        through `o` along `d` touches. A ray can only hit one of these, so
+        testing just them gives the same nearest hit as testing every
+        triangle, which is what a pick used to do (a rectangle selection with
+        400 visibility rays on a 120,000-triangle mesh took over a minute).
+        The spheres are a little larger than needed, to stay on the safe side
+        of rounding and of the ray test's own tolerance."""
+        S = self.centroid - o
+        along = S @ d
+        dd = float(d @ d)
+        if dd <= 0.0:
+            return np.arange(len(self.T))
+        dist2 = (S * S).sum(1) - along * along / dd
+        return np.nonzero(dist2 <= self._bound2())[0]
+
+    def _bound2(self):
+        """Squared radius of every triangle's bounding sphere around its centroid, padded."""
+        b = self.__dict__.get("_bound")
+        if b is None:
+            corners = self.V[self.T]                                    # (n, 3, 3)
+            r = np.sqrt(((corners - self.centroid[:, None, :]) ** 2).sum(-1).max(1))
+            b = self._bound = (r * (1.0 + 1e-4) + 1e-9) ** 2 + 1e-12
+        return b
+
+    def raycast_many(self, origin, directions, allowed=None):
+        """raycast() for many rays from one origin: a list of triangle ids
+        (None = no hit). Same answers as one raycast() per ray; the search for
+        the triangles near each ray is done for all rays together."""
+        o = np.asarray(origin, np.float64)
+        D = np.asarray(directions, np.float64).reshape(-1, 3)
+        out = []
+        if len(D) == 0:
+            return out
+        S = self.centroid - o
+        gap = (S * S).sum(1) - self._bound2()        # near the line when gap <= along^2 / |d|^2
+        for a0 in range(0, len(D), 64):
+            Dc = D[a0:a0 + 64]
+            dd = (Dc * Dc).sum(1)
+            along = S @ Dc.T                          # (triangles, rays)
+            near = gap[:, None] * dd[None, :] <= along * along
+            for j in range(len(Dc)):
+                idx = np.nonzero(near[:, j])[0] if dd[j] > 0.0 else np.arange(len(self.T))
+                if allowed is not None:
+                    idx = idx[allowed[idx]]
+                if len(idx) == 0:
+                    out.append(None)
+                    continue
+                t = self._moller(idx, o, Dc[j])
+                k = int(np.argmin(t))
+                out.append(None if not np.isfinite(t[k]) else int(idx[k]))
+        return out
+
     def raycast(self, origin, direction, allowed=None, candidates=None):
         """Nearest triangle hit by the ray, or None. Two-sided.
 
@@ -131,7 +184,7 @@ class Geometry:
         """
         d = np.asarray(direction, np.float64)
         o = np.asarray(origin, np.float64)
-        idx = np.arange(len(self.T)) if candidates is None else np.asarray(candidates, np.int64)
+        idx = self._near_line(o, d) if candidates is None else np.asarray(candidates, np.int64)
         if allowed is not None:
             idx = idx[allowed[idx]]
         if len(idx) == 0:

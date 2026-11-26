@@ -15,6 +15,7 @@ small window instead (see gui.py).
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -276,6 +277,12 @@ def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layer
             warnings.append("%s: this texture set isn't used by any part of the model in the .spp; "
                             "it is skipped when importing onto that model" % name)
         log("Texture set '%s'" % name)
+        if hasattr(log, "detail"):
+            try:
+                from .settings import available_memory_gb
+                log.detail("  free memory: %.1f GB" % available_memory_gb())
+            except Exception:
+                pass
         t = time.time()
         entry = {"name": name, "bundle": "materials/%s" % folder, "layers": 0, "match": None,
                  "nativeResolution": 2 ** int((m.get("resolutionLog2") or [11])[0]),
@@ -313,6 +320,10 @@ def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layer
             if hasattr(log, "detail"):
                 log.detail(traceback.format_exc())
         entries.append(entry)
+        # A finished texture set leaves reference cycles holding gigabytes of
+        # images at 4K; collect them now so the next set's workers get the memory.
+        mc = None
+        gc.collect()
         if saved:
             saved()
 

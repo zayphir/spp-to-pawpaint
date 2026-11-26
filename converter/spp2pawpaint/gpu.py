@@ -421,8 +421,18 @@ class GPUStrokePainter:
             return None
         raw = self.cov_fbo.read(viewport=(int(x0), int(y0), int(x1 - x0), int(y1 - y0)), components=1, dtype="f4")
         img = np.frombuffer(raw, np.float32).reshape(int(y1 - y0), int(x1 - x0))[::-1]
-        if not (img > 0).any():
+        drawn = img > 0
+        if not drawn.any():
             return None
-        cov = BM.coverage(img).astype(np.float32)
+        # The box read back is the bounding box of every triangle near the
+        # strokes, and most of it is empty. Keep the part that was drawn on, and
+        # turn -ln(T) into coverage only there: where nothing was drawn it is
+        # exactly 0 either way (1 - exp(-0)), so the mask is the same.
+        ys = np.nonzero(drawn.any(1))[0]
+        xs = np.nonzero(drawn.any(0))[0]
+        r0, r1, c0, c1 = int(ys[0]), int(ys[-1]) + 1, int(xs[0]), int(xs[-1]) + 1
+        img, drawn = img[r0:r1, c0:c1], drawn[r0:r1, c0:c1]
+        cov = np.zeros(img.shape, np.float32)
+        cov[drawn] = np.clip(BM.coverage(img[drawn]).astype(np.float32), 0, 1)
         # GL rows start at v = 0; our images start at the top (v = 1)
-        return RegionCover(self.res - int(y1), int(x0), np.ascontiguousarray(np.clip(cov, 0, 1)), self.res)
+        return RegionCover(self.res - int(y1) + r0, int(x0) + c0, cov, self.res)

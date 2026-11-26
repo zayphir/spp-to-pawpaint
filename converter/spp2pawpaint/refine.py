@@ -124,6 +124,21 @@ class _Progress:
             self.log("      %s: %d%% (about %s left)" % (self.what, 100 * done // self.steps, _duration(left)))
 
 
+def on_threads(fn, items):
+    """fn(item) for every item, on a few threads. For steps made of a few
+    numpy calls on whole images: there numpy does the work without holding
+    Python's lock, so threads help (unlike in the strips, see WORKERS)."""
+    items = list(items)
+    n = min(8, len(items), os.cpu_count() or 1) if WORKERS != 1 else 1
+    if n <= 1:
+        for it in items:
+            fn(it)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(fn, items))
+
+
 _POOL = {"ex": None, "n": 0}
 
 
@@ -356,8 +371,8 @@ def _trust_strip(job):
     C = _f(job["cache"]).reshape(-1, 3)
     inside = job["inside"].reshape(-1)
     K = np.stack([np.clip(L.k0(0, h, n), 0, 1) for L in leaves], 0)
-    cols = _cols(leaves, 0, h, n, {})
-    err = np.abs(forward_flat(leaves, cols, K, n) - C).max(1)
+    colsT = turn_cols(_cols(leaves, 0, h, n, {}))
+    err = np.abs(forward_turned(leaves, colsT, K, n) - _turned(C)).max(0)
     dom, vis = dominant(leaves, K, n)
     solid = inside & (vis >= 0.97) & (dom >= 0)
     np.add.at(tn, dom[solid], 1)
@@ -377,10 +392,12 @@ def _fit_strip(job):
     inside = job["inside"].reshape(-1)
     K = np.stack([L.k0(0, h, n) for L in leaves], 0)          # (nl, n)
     cols = _cols(leaves, 0, h, n, {})
-    pred = forward_flat(leaves, cols, K, n)
-    bad = inside & (np.abs(pred - C).max(1) > TOL)
+    colsT = turn_cols(cols)
+    CT = _turned(C)
+    bad = inside & (np.abs(forward_turned(leaves, colsT, K, n) - CT).max(0) > TOL)
     if bad.any() and job["normal"]:
-        K = solve(leaves, cols, K, C, bad, job["normal"], job["blends"], job["evidence"], 0, h, n, job["trusted"])
+        K = solve(leaves, cols, K, C, bad, job["normal"], job["blends"], job["evidence"], 0, h, n, job["trusted"],
+                  colsT)
     new = np.zeros((nl, h, res), np.uint8)
     for li, L in enumerate(leaves):
         if L.color is None or not L.fittable:
@@ -391,7 +408,7 @@ def _fit_strip(job):
             m = np.where(den > 1e-4, K[li] / np.maximum(den, 1e-4), 0.0)
         new[li] = (np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8).reshape(h, res)
     Kf = _final_k(leaves, new, 0, h, n)
-    err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
+    err = np.abs(forward_turned(leaves, colsT, Kf, n) - CT).max(0)
     dom, vis = dominant(leaves, Kf, n)
     solid = inside & (vis >= 0.97) & (dom >= 0)
     np.add.at(dn, dom[solid], 1)
@@ -419,7 +436,7 @@ def _check_strip(job):
                 blk = baked[li].reshape(-1, 3)
                 blk[sel] = (unapply(C[sel], chain) * 255 + 0.5).astype(np.uint8)
     cols = _cols(leaves, 0, h, n, baked)
-    err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
+    err = np.abs(forward_turned(leaves, turn_cols(cols), Kf, n) - _turned(C)).max(0)
     err_rows = np.minimum(err * 255.0, 255).astype(np.uint8).reshape(h, res)
     vis_rows = (np.clip(max_visibility(leaves, Kf, n), 0, 1) * 255).astype(np.uint8).reshape(h, res)
     return int((inside & (err > TOL)).sum()), err_rows, vis_rows, baked
@@ -445,6 +462,13 @@ def _fit(mc, cache_rgb, coverage, log=print):
     the final image where the layer shows."""
     from .masks import _dilate
     res = mc.res
+    t_start = time.time()
+    timing = []
+
+    def lap(what):      # where a long fit spends its time, for the log file
+        timing.append("%s %.1f s" % (what, time.time() - lap.t))
+        lap.t = time.time()
+    lap.t = t_start
     leaves = [Leaf(n, anc, res) for n, anc in collect(mc._stack[0])]
     fit_idx = [i for i, L in enumerate(leaves) if L.fittable]
     normal = [i for i in fit_idx if leaves[i].mode == "Normal"]
@@ -480,27 +504,8 @@ def _fit(mc, cache_rgb, coverage, log=print):
     # mask is: a layer completely covered by another one in the replay (e.g. a
     # base layer with the same colour as the layer above it) gets no credit
     # there, so recolouring the upper layer later recolours those texels too.
-    evidence = {i: np.zeros((res, res), np.uint8) for i in normal}
-    for y0 in range(0, res, 256):
-        y1 = min(res, y0 + 256)
-        n = (y1 - y0) * res
-        T = np.ones(n, np.float32)
-        for i in sorted(normal, reverse=True):
-            k = np.clip(leaves[i].k0(y0, y1, n), 0, 1)
-            evidence[i][y0:y1] = (k * T * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
-            T = T * (1 - k)
-    for i in normal:
-        evidence[i] = _dilate(evidence[i], EVIDENCE_RADIUS)
-    # blend layers (Multiply, Overlay, ...) may only act where the replay has
-    # them: otherwise e.g. a paw-bean Overlay highlight could 'explain' a white
-    # chest by brightening the pink under it
-    for i in multiply:
-        e = np.zeros((res, res), np.uint8)
-        for y0 in range(0, res, 256):
-            y1 = min(res, y0 + 256)
-            e[y0:y1] = (np.clip(leaves[i].k0(y0, y1, (y1 - y0) * res), 0, 1) * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
-        evidence[i] = _dilate(e, EVIDENCE_RADIUS)
-    covm = coverage > 0.5
+    # A big fit runs in worker processes (see WORKERS). They take a few seconds
+    # to start, so start them now, while the evidence is worked out here.
     workers = worker_count() if len(fit_idx) * res * res >= POOL_MIN_WORK else 1
     if workers == 1 and len(fit_idx) * res * res >= POOL_MIN_WORK and (os.cpu_count() or 1) > 1 and WORKERS != 1:
         log("      (too little free memory for worker processes; fitting on one core)")
@@ -509,6 +514,44 @@ def _fit(mc, cache_rgb, coverage, log=print):
         rows = max(1, min(rows, res // (workers * STRIPS_PER_WORKER)))
     spans = [(y0, min(res, y0 + rows)) for y0 in range(0, res, rows)]
     workers = min(workers, len(spans))
+    if workers > 1:
+        try:
+            ex = _pool(workers)
+            for _ in range(workers):
+                ex.submit(int)
+        except Exception:
+            close_pool()
+    evidence = {i: np.zeros((res, res), np.uint8) for i in normal}
+    down = sorted(normal, reverse=True)
+
+    def visible_rows(y0):
+        y1 = min(res, y0 + 256)
+        n = (y1 - y0) * res
+        T = np.ones(n, np.float32)
+        for i in down:
+            k = np.clip(leaves[i].k0(y0, y1, n), 0, 1)
+            evidence[i][y0:y1] = (k * T * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
+            T = T * (1 - k)
+    on_threads(visible_rows, range(0, res, 256))
+
+    def spread(i):
+        evidence[i] = _dilate(evidence[i], EVIDENCE_RADIUS)
+    on_threads(spread, normal)
+
+    # blend layers (Multiply, Overlay, ...) may only act where the replay has
+    # them: otherwise e.g. a paw-bean Overlay highlight could 'explain' a white
+    # chest by brightening the pink under it
+    def blend_evidence(i):
+        e = np.zeros((res, res), np.uint8)
+        for y0 in range(0, res, 256):
+            y1 = min(res, y0 + 256)
+            e[y0:y1] = (np.clip(leaves[i].k0(y0, y1, (y1 - y0) * res), 0, 1) * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
+        evidence[i] = _dilate(e, EVIDENCE_RADIUS)
+    for i in multiply:
+        evidence[i] = None
+    on_threads(blend_evidence, multiply)
+    covm = coverage > 0.5
+    lap("evidence")
 
     def jobs(**more):
         """One job per strip: the layers, Substance's picture and the island mask, cut to its rows."""
@@ -530,6 +573,7 @@ def _fit(mc, cache_rgb, coverage, log=print):
         for i, L in enumerate(leaves):
             if L.exact and L.fittable and (L.mode != "Normal" or tb[i] <= TRUST_MAX_BAD * max(int(tn[i]), 1)):
                 trusted.add(i)
+    lap("exact layers check")
     # pass 1: fit the masks
     if workers > 1:
         log("      (%d layers to fit on %d CPU cores)" % (len(fit_idx), workers))
@@ -547,6 +591,7 @@ def _fit(mc, cache_rgb, coverage, log=print):
         dom_n += dn
         dom_bad += db
     del parts
+    lap("fit")
     # layers whose own area is consistently off: their content isn't flat
     bake_ids = [li for li in normal
                 if dom_n[li] >= BAKE_MIN_TEXELS and dom_bad[li] > BAKE_SHARE * dom_n[li]]
@@ -577,6 +622,7 @@ def _fit(mc, cache_rgb, coverage, log=print):
         for li, rows_ in bk.items():
             baked_i[li][y0:y1] = rows_
     del parts
+    lap("check")
     # The edge allowance (TOL_FIX) is for anti-aliased edges between layers:
     # partly covered texels right next to fully covered ones. Wide soft areas
     # (glows, blurred shapes) get the strict tolerance; they used to pass as
@@ -599,6 +645,10 @@ def _fit(mc, cache_rgb, coverage, log=print):
             resid[grow, :3] = cache_rgb[..., :3][grow]
             resid[grow, 3] = 255
     stats["estimated"] = estimated
+    lap("detail fix")
+    detail = getattr(log, "detail", None)
+    if detail is not None and time.time() - t_start >= 2.0:
+        detail("      fit timing: %s (%d strips, %d workers)" % (", ".join(timing), len(spans), workers))
     return new, baked, (resid if n_fix else None), stats
 
 
@@ -633,18 +683,57 @@ def max_visibility(leaves, K, n):
     return best
 
 
-def forward_flat(leaves, cols, K, n):
-    acc = np.zeros((n, 3), np.float32)
+def turn_cols(cols):
+    """A list of layer colours ((n, 3) arrays or None, as _cols gives them) for
+    forward_turned: (3, n) arrays, and a (3, 1) column for a layer that has one
+    colour everywhere, which numpy then handles without touching n values."""
+    out = []
+    for c in cols:
+        if c is None:
+            out.append(None)
+        elif c.strides[0] == 0:                 # np.broadcast_to of one colour
+            out.append(np.array(c[0], np.float32).reshape(3, 1))
+        else:
+            out.append(_turned(c))
+    return out
+
+
+def take_cols(colsT, idx):
+    """Turned colours for a subset of the texels."""
+    return [None if c is None else (c if c.shape[1] == 1 else c[:, idx]) for c in colsT]
+
+
+def _merge_turned(acc, acc_a, top, a, mode):
+    """merge() for (3, n) colours; `top` may be a (3, 1) column."""
+    b = blend(mode, acc, top)
+    a_out = a + acc_a * (1.0 - a)
+    w = np.where(a_out > 0, 1.0 / np.maximum(a_out, 1e-12), 0.0)
+    c = (b * a + acc * (acc_a * (1.0 - a))) * w
+    c = np.where(a_out > 0, c, acc)
+    return c, a_out
+
+
+def forward_turned(leaves, colsT, K, n):
+    """The picture the layers give with coverages K, as (3, n). Same numbers
+    as merging (n, 3) arrays layer by layer, computed channel by channel
+    (see _turned)."""
+    acc = np.zeros((3, n), np.float32)
     acc_a = np.zeros(n, np.float32)
-    for L, c, k in zip(leaves, cols, K):
+    for L, c, k in zip(leaves, colsT, K):
         if c is None:
             continue
-        acc, acc_a = merge(acc, acc_a, c, k, L.mode if L.mode in ("Normal", "Multiply", "Add", "Screen",
-                                                              "Overlay", "Soft Light", "Hard Light") else "Normal")
+        acc, acc_a = _merge_turned(acc, acc_a, c, k,
+                                   L.mode if L.mode in ("Normal", "Multiply", "Add", "Screen",
+                                                        "Overlay", "Soft Light", "Hard Light") else "Normal")
     # Where the layers don't cover a texel completely, Substance's result is
     # the colour over black (a test project's Blush glow sits on an island with nothing
     # under it: cache 147,0,0 at coverage 0.29, not 255,0,0).
-    return acc * acc_a[:, None] if OVER_BLACK else acc
+    return acc * acc_a if OVER_BLACK else acc
+
+
+def forward_flat(leaves, cols, K, n):
+    """forward_turned for (n, 3) colours, returning (n, 3)."""
+    return np.ascontiguousarray(forward_turned(leaves, turn_cols(cols), K, n).T)
 
 
 def _step(v, mode, t, k, nz=None):
@@ -681,7 +770,29 @@ def unapply(C, chain, iters=4):
     return base
 
 
-def _fit_strengths(base, Cb, chain_specs, k0):
+def _turned(a):
+    """(m, 3) colours as a contiguous (3, m) array. numpy runs a step over
+    'every texel of one channel' several times faster than one over 'the three
+    channels of every texel' (which is what a per-texel strength times an
+    (m, 3) array is), and the numbers are the same."""
+    return np.ascontiguousarray(a.T)
+
+
+def _step_turned(v, mode, t, k, nz):
+    """_step for (3, m) colours; `nz` = np.flatnonzero(k). Picking out some
+    texels costs more per texel than a pass over all of them, so that is only
+    done when the layer acts on few (measured: under a tenth)."""
+    if len(nz) == 0:
+        return v
+    if len(nz) * 10 > len(k):
+        return v + (blend(mode, v, t) - v) * k
+    out = v.copy()
+    vs = v[:, nz]
+    out[:, nz] = vs + (blend(mode, vs, t[:, nz]) - vs) * k[nz]
+    return out
+
+
+def _fit_strengths(base, Cb, chain_specs, k0, turned=None):
     """Closed-form strengths of the blend layers above `base` (two passes of
     coordinate descent; each layer's effect is ~linear in its strength).
 
@@ -689,40 +800,46 @@ def _fit_strengths(base, Cb, chain_specs, k0):
     other layers at their current strength. The part of the chain below q is
     the same for both and for the next q, so it is carried along in `v`
     instead of being recomputed, and layers above q are skipped where their
-    strength is 0 (_step). Both give exactly the values of running the whole
-    chain every time, which is what this did before and what made texture
-    sets with many blend layers take hours (the work grew with the square of
-    their number, on every texel)."""
+    strength is 0. Both give exactly the values of running the whole chain
+    every time, which is what this did before and what made texture sets with
+    many blend layers take hours (the work grew with the square of their
+    number, on every texel).
+
+    `turned`: (_turned(Cb), [_turned(colour) for the chain]) when the caller
+    has them already (solve calls this once per candidate layer)."""
+    CbT, ts = turned if turned is not None else (_turned(Cb), [_turned(t) for _, t in chain_specs])
+    v0 = _turned(base)
     ks = [np.array(k, np.float32) for k in k0]
     nzs = [np.flatnonzero(k) for k in ks]
     nb = len(chain_specs)
     for _ in range(2):
-        v = base                           # the chain below q, at the strengths fitted so far
+        v = v0                             # the chain below q, at the strengths fitted so far
         for q in range(nb):
-            md, t = chain_specs[q]
-            b = blend(md, v, t)
+            bv = blend(chain_specs[q][0], v, ts[q]) - v
             F0 = v
-            F1 = v + (b - v)
+            F1 = v + bv
             for r in range(q + 1, nb):
-                mr, tr = chain_specs[r]
-                F0 = _step(F0, mr, tr, ks[r], nzs[r])
-                F1 = _step(F1, mr, tr, ks[r], nzs[r])
+                mr = chain_specs[r][0]
+                F0 = _step_turned(F0, mr, ts[r], ks[r], nzs[r])
+                F1 = _step_turned(F1, mr, ts[r], ks[r], nzs[r])
             d = F1 - F0
-            num = ((Cb - F0) * d).sum(1) + MULTIPLY_PRIOR * k0[q]
-            den = (d * d).sum(1) + MULTIPLY_PRIOR
+            num = ((CbT - F0) * d).sum(0) + MULTIPLY_PRIOR * k0[q]
+            den = (d * d).sum(0) + MULTIPLY_PRIOR
             ks[q] = np.clip(num / np.maximum(den, 1e-12), 0, 1)
             nzs[q] = np.flatnonzero(ks[q])
-            v = v + (b - v) * ks[q][:, None]
+            v = v + bv * ks[q]
     return ks
 
 
-def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=()):
-    """Re-explain the mismatched texels `bad` (bool, n)."""
+def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=(), colsT=None):
+    """Re-explain the mismatched texels `bad` (bool, n). `colsT`: turn_cols(cols), if the caller has it."""
     idx = np.nonzero(bad)[0]
     Cb = C[idx]
     m = len(idx)
     specs_all = [(leaves[q].mode, cols[q][idx]) for q in blends]
     k0_all = [K[q][idx] for q in blends]
+    CbT = _turned(Cb)
+    specs_T = [_turned(t) for _, t in specs_all]
     best_cost = np.full(m, np.inf, np.float32)
     best = np.full(m, -1, np.int64)
     best_k = [np.array(k, np.float32) for k in k0_all]
@@ -735,7 +852,8 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
         above = [r for r, q in enumerate(blends) if q > j]       # blend layers that act on j
         ks = [np.array(k, np.float32) for k in k0_all]
         if above:
-            sub = _fit_strengths(cj, Cb, [specs_all[r] for r in above], [k0_all[r] for r in above])
+            sub = _fit_strengths(cj, Cb, [specs_all[r] for r in above], [k0_all[r] for r in above],
+                                 (CbT, [specs_T[r] for r in above]))
             for r, k in zip(above, sub):
                 ks[r] = k
         F = apply_chain(cj, [(specs_all[r][0], specs_all[r][1], ks[r]) for r in above])
@@ -826,7 +944,8 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     edit_k = np.zeros(m, np.float32)
     if ONE_EDIT:
         Ks = np.stack([np.asarray(K[i][idx], np.float32) for i in range(len(leaves))], 0)
-        cs = [None if c is None else c[idx] for c in cols]
+        cs = take_cols(colsT if colsT is not None else turn_cols(cols), idx)
+
         below = np.zeros(m, np.float32)        # coverage of the Normal layers under j
         under = {}
         for j in sorted(normal):
@@ -851,17 +970,18 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
                 continue
             sub = np.nonzero(live)[0]
             K1 = Ks[:, sub].copy()
-            csub = [None if c is None else c[sub] for c in cs]
+            csub = take_cols(cs, sub)
+            Cs = CbT[:, sub]
             K1[j] = 0.0
-            F0 = forward_flat(leaves, csub, K1, len(sub))
+            F0 = forward_turned(leaves, csub, K1, len(sub))
             K1[j] = kmax[sub]
-            F1 = forward_flat(leaves, csub, K1, len(sub))
+            F1 = forward_turned(leaves, csub, K1, len(sub))
             dv = F1 - F0
-            t = np.clip(((Cb[sub] - F0) * dv).sum(1) / np.maximum((dv * dv).sum(1), 1e-8), 0, 1)
+            t = np.clip(((Cs - F0) * dv).sum(0) / np.maximum((dv * dv).sum(0), 1e-8), 0, 1)
             knew = t * kmax[sub]
             K1[j] = knew
-            dd = Cb[sub] - forward_flat(leaves, csub, K1, len(sub))
-            cost = (dd ** 2).sum(1) + EDIT_WEIGHT * np.abs(knew - Ks[j][sub])
+            dd = Cs - forward_turned(leaves, csub, K1, len(sub))
+            cost = (dd ** 2).sum(0) + EDIT_WEIGHT * np.abs(knew - Ks[j][sub])
             if leaves[j].mode != "Normal":      # blend strength beyond what the replay has
                 cost = cost + 4 * EVIDENCE_WEIGHT * np.maximum(knew - ev[sub], 0)
             better = cost < edit_cost[sub]

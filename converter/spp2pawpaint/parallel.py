@@ -110,6 +110,19 @@ def _builder(mat, res, baked_urls, lossless=False, engine="cpu"):
 
 
 def _task(payload):
+    out, msgs = _mask(payload)
+    return out, msgs
+
+
+def _timed_task(payload):
+    """_task plus how long it took and which process did it (for the log file)."""
+    import time
+    t = time.perf_counter()
+    out, msgs = _mask(payload)
+    return out, msgs, time.perf_counter() - t, os.getpid()
+
+
+def _mask(payload):
     mat, res, baked_urls, ancestors, layer, lossless, engine = pickle.loads(payload)
     b = _builder(mat, res, baked_urls, lossless, engine)
     b._msgs.clear()
@@ -150,14 +163,14 @@ class MaskPool:
             self._start()
         payload = pickle.dumps((mat, res, dict(baked_urls), [geo_spec(a) for a in ancestors], layer, lossless,
                                 engine), protocol=pickle.HIGHEST_PROTOCOL)
-        self.futures[key] = self.ex.submit(_task, payload)
+        self.futures[key] = self.ex.submit(_timed_task, payload)
         return key
 
     def result(self, key):
         f = self.futures.get(key)
         if f is None:
             return None
-        m, msgs = f.result()
+        m, msgs, self.last_seconds, self.last_worker = f.result()
         return (None if m is None else m.astype(np.float32)), msgs
 
     def release(self):

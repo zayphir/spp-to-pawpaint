@@ -278,10 +278,17 @@ class MaskBuilder:
         return self._coverage
 
     def _raster(self, tris):
+        """Coverage of a set of triangles, as the part of the texture they touch
+        (the same texels as a full image; a selection used to be a whole
+        res x res float image, to build, to keep and to blend)."""
         tris = tris[self._in_mat[tris]]
         if len(tris) == 0:
             return None
-        return np.asarray(self.geo.rasterize(tris, self.res), np.float32) / 255.0
+        img = self.geo.rasterize(tris, self.res)
+        box = img.getbbox()
+        if box is None:
+            return None
+        return RegionCover(box[1], box[0], np.asarray(img.crop(box), np.float32) / 255.0, self.res)
 
     def _selection_cover(self, tri, gran):
         g = self.geo
@@ -392,9 +399,19 @@ class MaskBuilder:
         (x0, y0), (x1, y1) = p0, p1
         lo_x, hi_x = sorted((x0, x1))
         lo_y, hi_y = sorted((y0, y1))
-        uv = self.geo.UV[self.geo.T[self.tris]]
-        ok = ((uv[..., 0].max(1) >= lo_x) & (uv[..., 0].min(1) <= hi_x) &
-              (uv[..., 1].max(1) >= lo_y) & (uv[..., 1].min(1) <= hi_y))
+        c = self.__dict__.get("_uv_boxes")
+        if c is None:   # the triangles' UVs and their bounding boxes, once per texture set
+            uv_all = self.geo.UV[self.geo.T[self.tris]]
+            c = self._uv_boxes = (uv_all, uv_all[..., 0].min(1), uv_all[..., 0].max(1),
+                                  uv_all[..., 1].min(1), uv_all[..., 1].max(1))
+        uv_all, u_min, u_max, v_min, v_max = c
+        # only triangles whose box meets the rectangle can overlap it; the exact
+        # test below is the same per triangle as it was over all of them
+        cand = np.nonzero((u_max >= lo_x) & (u_min <= hi_x) & (v_max >= lo_y) & (v_min <= hi_y))[0]
+        if len(cand) == 0:
+            return self.tris[cand]
+        uv = uv_all[cand]
+        ok = np.ones(len(cand), bool)
         corners = np.array([[lo_x, lo_y], [hi_x, lo_y], [hi_x, hi_y], [lo_x, hi_y]])
         for a, b in ((0, 1), (1, 2), (2, 0)):
             e = uv[:, b] - uv[:, a]
@@ -403,7 +420,7 @@ class MaskBuilder:
             pc = ((corners[None] - uv[:, a][:, None]) * n[:, None]).sum(-1)
             separated = np.where(side[:, None] >= 0, pc < 0, pc > 0).all(1)
             ok &= ~separated
-        return self.tris[ok]
+        return self.tris[cand[ok]]
 
     def _rect_picks(self, hit, inv_pv):
         (x0, y0), (x1, y1) = hit["position0"], hit["position1"]
@@ -431,15 +448,16 @@ class MaskBuilder:
             inv_dm = inv_pv if dm is None else dm @ inv_pv
             q = inv_dm @ np.array([0, 0, -1.0, 1.0])
             cam = q[:3] / q[3] if abs(q[3]) > 1e-12 else None
-            for t in cand[:budget]:
-                c = self.geo.centroid[t]
-                if cam is None:
-                    vis.append(t)
-                    continue
-                d = c - cam
-                d /= np.linalg.norm(d)
-                if self.geo.raycast(cam, d, self.allowed) == t:
-                    vis.append(t)
+            if cam is None:
+                vis.extend(cand[:budget])
+            else:
+                dirs = []
+                for t in cand[:budget]:
+                    d = self.geo.centroid[t] - cam
+                    d /= np.linalg.norm(d)
+                    dirs.append(d)
+                hits = self.geo.raycast_many(cam, dirs, self.allowed)
+                vis.extend(t for t, h in zip(cand[:budget], hits) if h == t)
             if len(cand) > budget:
                 vis.extend(cand[budget:].tolist())
             # A tiny drag acts like a click on the triangle under it. A drag

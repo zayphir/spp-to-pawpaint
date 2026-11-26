@@ -3,13 +3,14 @@
 import json
 import os
 import re
+import time
 
 import numpy as np
 from PIL import Image
 
 from . import procedural as P
 from . import sppfile as S
-from .masks import BLEND_DISABLE, BLEND_NORMAL, MaskBuilder, _dilate, _source_url, as_full, as_list, pad
+from .masks import BLEND_DISABLE, BLEND_NORMAL, MaskBuilder, RegionCover, _dilate, _source_url, as_full, as_list, pad
 
 # Substance blending mode ids as stored in .spp files: the position in
 # Substance's own BlendingMode list (measured 2026-11-23 with the calibration
@@ -463,7 +464,13 @@ class MaterialConverter:
         m = None
         if pkey is not None:
             try:
+                t_wait = time.time()
                 m, msgs = self.pool.result(pkey)
+                detail = getattr(self.log, "detail", None)
+                if detail is not None:
+                    detail("      mask from worker %s: computed in %.1f s, waited %.1f s for it" % (
+                        getattr(self.pool, "last_worker", "?"), getattr(self.pool, "last_seconds", 0.0),
+                        time.time() - t_wait))
                 for msg in msgs:
                     self._warn(msg)
             except Exception as e:  # a worker died (e.g. out of memory): do it here instead
@@ -647,6 +654,26 @@ class MaterialConverter:
         spec["channels"] = channels
         return {"kind": "paint", "channels": {c: (_u8(v), _u8(a)) for c, (v, a) in rendered.items()}}
 
+    def _content_cover(self, act):
+        """Brush coverage of one paint/eraser action for the layer's content:
+        (coverage, (row slice, column slice)) with the coverage cut to the part
+        of the texture the strokes touch, or (None, None) without strokes.
+        Outside that part the coverage is 0 and blending changes nothing, so
+        _render_paint only blends there; it used to blend every action over
+        the whole texture (a 4K paint layer of 43 actions took half a minute)."""
+        c = self._builder_for(act)._stroke_cover(act)
+        if c is None:
+            return None, None
+        if isinstance(c, RegionCover) and c.res == self.res:
+            return c.data, c.slices()
+        full = self._up(as_full(c))
+        ys = np.nonzero(full.any(1))[0]
+        xs = np.nonzero(full.any(0))[0]
+        if len(ys) == 0:
+            return full[:0, :0], (slice(0, 0), slice(0, 0))
+        sl = (slice(int(ys[0]), int(ys[-1]) + 1), slice(int(xs[0]), int(xs[-1]) + 1))
+        return full[sl], sl
+
     def _render_paint(self, actions):
         """Render a layer's own actions per channel -> {cid: (value HxWxC or HxW, alpha)}."""
         if self.mb is None:
@@ -666,14 +693,12 @@ class MaterialConverter:
         for act in flat:
             cls = act.get("__class")
             maps = {}
+            sl = (slice(None), slice(None))       # the part of the texture `cov` is for
             if cls == "DataActionFill":
                 vals, maps = self._fill_content(act)
                 cov = (self._fill_alpha if self._fill_alpha is not None
                        else np.ones((self.res, self.res), np.float32))
             elif cls == "DataActionPaint":
-                cov = self._up(as_full(self._builder_for(act)._stroke_cover(act)))
-                if cov is None:
-                    continue
                 vals = {}
                 for src in as_list(act.get("sourceColor")):
                     if src.get("__class") != "DataSourceUniform":
@@ -682,11 +707,23 @@ class MaterialConverter:
                     if flag in CHANNEL_MAP:
                         vals[CHANNEL_MAP[flag][0]] = {"value": self._value_for(flag, list(src.get("color") or [0, 0, 0])),
                                                       "opacity": float(act.get("opacity", 1.0))}
+                if not vals:
+                    # Nothing this action paints can be used (e.g. a brush whose
+                    # colour comes from a Substance material): don't replay its
+                    # strokes. A layer of several hundred such actions took over
+                    # a minute at 4K for a result that was thrown away.
+                    continue
+                cov, sl = self._content_cover(act)
+                if cov is None:
+                    continue
             elif cls == "DataActionEraser":
-                cov = self._up(as_full(self._builder_for(act)._stroke_cover(act)))
+                if not out:
+                    continue        # nothing painted yet, so nothing to erase
+                cov, sl = self._content_cover(act)
                 if cov is not None:
                     for cid in out:
-                        out[cid] = (out[cid][0], out[cid][1] * (1 - cov))
+                        al = out[cid][1]
+                        al[sl] = al[sl] * (1 - cov)
                 continue
             elif cls == "DataActionFilterLevels":
                 bits = int(act.get("channelTypes", 0))
@@ -726,8 +763,9 @@ class MaterialConverter:
                     out[cid] = (np.zeros(shape, np.float32), np.zeros((self.res, self.res), np.float32))
                 val, al = out[cid]
                 kk = k[..., None] if val.ndim == 3 else k
-                val += (v - val) * kk
-                al += (1 - al) * k
+                vs = v[sl] if "image" in e else v
+                val[sl] += (vs - val[sl]) * kk
+                al[sl] += (1 - al[sl]) * k
         return out or None
 
     def _walk(self, items, parent_idx, path):
