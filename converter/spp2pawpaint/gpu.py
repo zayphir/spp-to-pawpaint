@@ -52,6 +52,57 @@ def available():
     return True, ctx.info.get("GL_RENDERER", "GPU")
 
 
+def _gl_get_integer():
+    """OpenGL's glGetIntegerv as get(name, count) -> [int], or None. moderngl
+    has no call for the two memory extensions below, so the function is taken
+    from the system's OpenGL library; it acts on the current context."""
+    import ctypes
+    import os
+    import sys
+    try:
+        if os.name == "nt":
+            fn = ctypes.windll.opengl32.glGetIntegerv
+        elif sys.platform == "darwin":
+            return None
+        else:
+            import ctypes.util
+            fn = ctypes.CDLL(ctypes.util.find_library("GL") or "libGL.so.1").glGetIntegerv
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_int)]
+    fn.restype = None
+
+    def get(name, count):
+        buf = (ctypes.c_int * max(count, 4))()
+        fn(name, buf)
+        return [int(v) for v in buf[:count]]
+    return get
+
+
+def memory_mb():
+    """(total, free) video memory in MB of the card this thread's context runs
+    on, as its driver reports it; None for what it doesn't report. NVIDIA
+    gives both (GL_NVX_gpu_memory_info), AMD what is free (GL_ATI_meminfo)."""
+    ctx = context()
+    if ctx is None:
+        return None, None
+    try:
+        ext = ctx.extensions
+        get = _gl_get_integer()
+        if get is None:
+            return None, None
+        if "GL_NVX_gpu_memory_info" in ext:
+            total = get(0x9047, 1)[0] / 1024.0      # dedicated memory, in KB
+            free = get(0x9049, 1)[0] / 1024.0       # available now
+            return (total if total > 0 else None), (free if free > 0 else None)
+        if "GL_ATI_meminfo" in ext:
+            free = get(0x87FC, 4)[0] / 1024.0       # free texture memory, in KB
+            return None, (free if free > 0 else None)
+    except Exception:
+        pass
+    return None, None
+
+
 SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "swiftshader", "software rasterizer",
                       "microsoft basic render", "gdi generic")
 

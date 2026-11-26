@@ -99,8 +99,12 @@ def run_gui(initial=None):
             ok, name = gpu.available()
             if ok and gpu.is_software(name):
                 msgs.put(("gpu", "GPU: only software OpenGL (%s); Auto uses the CPU, which is faster" % name))
+            elif ok:
+                from . import vram
+                memory = vram.video_memory()
+                msgs.put(("gpu", "GPU: %s" % (vram.describe(memory) if memory else name)))
             else:
-                msgs.put(("gpu", ("GPU: %s" % name) if ok else "GPU: not available (%s), the CPU will be used" % name))
+                msgs.put(("gpu", "GPU: not available (%s), the CPU will be used" % name))
         except Exception as e:
             msgs.put(("gpu", "GPU: not available (%s), the CPU will be used" % e))
     threading.Thread(target=detect_gpu, daemon=True).start()

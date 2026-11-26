@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3 – 2026-11-26
+The size now follows your graphics card, so big projects come in with all their layers instead of only the flattened result. Nothing about how layers are converted has changed: at the same size, every file the converter writes for the test projects is identical to 0.6.2's.
+
+- **Why some materials came in with only 'Substance Result (flattened)'.** PawPaint keeps every layer on the graphics card and refuses a material that needs more video memory than is free. A layer with a mask takes about 117 MB at 4096, so a material with 120 layers needs about 15 GB there, and a quarter of that at 2048.
+- **Plugin: new 'Size' option, on 'Auto (fit graphics card)'.** When PawPaint refuses a material, the plugin opens the project one size smaller and imports everything again with every layer, instead of leaving layers out. It uses the files you already converted (PawPaint scales them) and says so when it is done. 'As converted' keeps the size; 2048, 1024 and 512 set it by hand.
+- **Converter: Resolution 'Auto' looks at your graphics card first.** It reads how much video memory the card has and has free, works out roughly what PawPaint will need, and converts at the largest size that can be imported. A smaller size also converts several times faster. It says what it chose and why. Pick a resolution yourself to decide otherwise.
+- **The numbers are shown.** The window and `log.txt` say what the project will need, and `report.txt` lists it per material at the converted size and the next one down.
+- **When the size can't go down** (importing into the open project, or a size set by hand), a material that doesn't fit is imported without its hidden layers before the plugin falls back to the flattened result alone, and the message gives PawPaint's numbers.
+- The window's GPU line shows the card's video memory.
+- The plugin is 0.6.3 too, so both parts carry the same number again.
+
 ## 0.6.2 – 2026-11-26
 Big projects convert much faster, and a long run now says what it is doing. The layers come out exactly as with 0.6.1: every file the converter writes for the test projects is identical, byte for byte. The one exception is the fix at the end of this list.
 

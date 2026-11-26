@@ -13,10 +13,20 @@
 --
 -- Unofficial community tool, not made or supported by PawWorks or Adobe.
 
-local IMPORTER_VERSION = "0.5.2"
+local IMPORTER_VERSION = "0.6.3"
 local PENDING_FILE = "scripts/spp_importer_pending.json"
 
 local MESH_SPP, MESH_OWN, MESH_OPEN = 1, 2, 3
+-- 'Size' option: the size of the textures in the PawPaint project. PawPaint
+-- keeps every layer on the graphics card, and what a layer takes goes with
+-- the texture area, so a project that doesn't fit at 4096 needs a quarter of
+-- the video memory at 2048. Auto starts at the size of the conversion and
+-- goes down a size when PawPaint refuses a texture set, instead of leaving
+-- layers out. PawPaint scales the converted images itself.
+local SIZE_AUTO, SIZE_CONVERTED = 1, 2
+local SIZE_OPTIONS = { "Auto (fit graphics card)", "As converted", "2048", "1024", "512" }
+local SIZE_VALUES = { [3] = 2048, [4] = 1024, [5] = 512 }
+local MIN_AUTO_SIZE = 1024   -- Auto doesn't go below this by itself
 -- kinds for channels a conversion may use beyond the built-in ones
 local EXTRA_CHANNEL_KINDS = {opacity = "scalar", specular = "color", glossiness = "scalar", displacement = "signed"}
 
@@ -24,6 +34,7 @@ local state = {
     folder = "",
     mesh = "",
     meshSource = MESH_SPP,
+    size = SIZE_AUTO,
     flatMode = 1,          -- 1 on top + visible, 2 on top + hidden, 3 leave out
     layers = true,
     baked = true,
@@ -116,24 +127,36 @@ local function usePending(quiet)
 end
 
 -- -- building the import spec -----------------------------------------------
--- level: 0 everything chosen in the panel; 1 also leaves out the baked
--- normal layer; 2 only the flattened Substance result. Levels 1 and 2 are the
--- fallbacks when PawPaint refuses a texture set for lack of video memory.
-local function wantLayer(l, level)
+-- level: 0 everything chosen in the panel; 1 leaves out the baked normal
+-- layer; 2 also the hidden layers (they don't show, but they are the options
+-- a creator left in the file); 3 only the flattened Substance result. Levels
+-- 1 to 3 are the fallbacks when PawPaint refuses a texture set for lack of
+-- video memory and the project can't be made smaller instead.
+local LAST_LEVEL = 3
+local function wantLayer(l, level, hidden)
+    level = level or 0
     local spp = nonNull(l.spp) or {}
     local role = nonNull(spp.role)
     if role == "flattened" then return state.flatMode ~= 3 end
-    if level and level >= 2 then return false end
-    if role == "baked_normal" then return state.baked and not (level and level >= 1) end
+    if level >= LAST_LEVEL then return false end
+    if role == "baked_normal" then return state.baked and level < 1 end
+    if level >= 2 and hidden then return false end
     return state.layers
 end
 
--- Returns spec, meta (tag -> layer info) for one bundle.
+-- Returns spec, meta (tag -> layer info) and the number of hidden layers left
+-- out, for one bundle.
 local function buildSpec(dir, manifest, level)
     local spec, meta = {}, {}
     local newIndex = {}
+    local hiddenAt, leftHidden = {}, 0
     for i, l in ipairs(nonNull(manifest.layers) or {}) do
-        if wantLayer(l, level) then
+        -- hidden itself, or inside a hidden folder (folders come before their layers)
+        local up = nonNull(l.parent)
+        hiddenAt[i] = nonNull(l.visible) == false or (up ~= nil and hiddenAt[up] == true)
+        local want = wantLayer(l, level, hiddenAt[i])
+        if not want and hiddenAt[i] and wantLayer(l, 1, false) then leftHidden = leftHidden + 1 end
+        if want then
             local spp = nonNull(l.spp) or {}
             local tag = nonNull(spp.tag) or ("#spp" .. i)
             local name = tostring(nonNull(l.name) or "Layer")
@@ -192,7 +215,19 @@ local function buildSpec(dir, manifest, level)
                           only = nonNull(spp.onlyChannels), maps = nonNull(spp.mapChannels) }
         end
     end
-    return spec, meta
+    return spec, meta, leftHidden
+end
+
+local function gigabytes(mb)
+    return string.format("%.1f GB", mb / 1024)
+end
+
+-- "it needs about 15.1 GB and 7.9 GB is free", from PawPaint's refusal.
+local function memoryText(need, free)
+    if need and free then
+        return string.format("it needs about %s of video memory and %s is free", gigabytes(need), gigabytes(free))
+    end
+    return "there is not enough free video memory"
 end
 
 -- -- after a material's layers land -------------------------------------------
@@ -330,8 +365,11 @@ local function importMaterials(ctx, done)
     pp.layers.setActiveMaterial(job.index)
     local before = pp.layers.count()
     local full = 0
+    local short = nil      -- memoryText of the first refusal
+    local advice = "Close other programs that use the graphics card (Substance Painter, games, browsers)"
+        .. (ctx.canResize and ", or pick a smaller Size, then import again." or ", then import again.")
     local function attempt(level)
-        local spec, meta = buildSpec(dir, manifest, level)
+        local spec, meta, leftHidden = buildSpec(dir, manifest, level)
         if level == 0 then full = #spec end
         if #spec == 0 then
             if level > 0 then
@@ -347,6 +385,20 @@ local function importMaterials(ctx, done)
             if r.ok then
                 local n = finishMaterial(job.index, before, meta, ctx.fresh)
                 log(string.format("'%s': %d layers imported", job.entry.name, n))
+                -- say what a fallback left out
+                if level == 1 and #spec < full then
+                    ctx.notes[#ctx.notes + 1] = string.format(
+                        "'%s': not enough free video memory for everything (%s), so the baked normal layer was left out. %s",
+                        job.entry.name, short, advice)
+                elseif level == 2 then
+                    ctx.notes[#ctx.notes + 1] = string.format(
+                        "'%s': not enough free video memory for its %d layers (%s), so its %d hidden layers%s were left out. %s",
+                        job.entry.name, full, short, leftHidden, state.baked and " and the baked normal" or "", advice)
+                elseif level >= LAST_LEVEL then
+                    ctx.notes[#ctx.notes + 1] = string.format(
+                        "'%s': not enough free video memory for its %d layers (%s), so only the flattened result was imported. %s",
+                        job.entry.name, full, short, advice)
+                end
             else
                 log(string.format("'%s': import %s", job.entry.name, tostring(r.state)))
             end
@@ -359,19 +411,27 @@ local function importMaterials(ctx, done)
             local why = tostring(err)
             log(string.format("'%s' was refused: %s", job.entry.name, why))
             -- PawPaint 1.27+ refuses an import that needs more video memory
-            -- than is free. Try again with less instead of leaving it empty.
-            if why:lower():find("video memory", 1, true) and level < 2 then
-                local nextLevel = level + 1
-                log(string.format("'%s': trying again with %s", job.entry.name,
-                    nextLevel == 1 and "the baked normal layer left out" or "only the flattened Substance result"))
-                if nextLevel == 2 then
-                    ctx.notes[#ctx.notes + 1] = string.format(
-                        "'%s': not enough free video memory for its %d layers, so only the flattened result was imported. "
-                        .. "Close other programs that use the graphics card (Substance Painter, games, browsers) "
-                        .. "or convert at a lower resolution, then import again.", job.entry.name, full)
+            -- than is free.
+            if why:lower():find("video memory", 1, true) then
+                local need = tonumber(why:match("needs about (%d+) MB"))
+                local free = tonumber(why:match("about (%d+) MB is free"))
+                short = short or memoryText(need, free)
+                -- First choice: the whole project one size smaller, which
+                -- keeps every layer (a quarter of the memory per step).
+                if level == 0 and ctx.shrink and ctx.size > MIN_AUTO_SIZE then
+                    ctx.shrink(job.entry.name, full, need, free)
+                    return
                 end
-                attempt(nextLevel)
-                return
+                -- Otherwise try again with less instead of leaving it empty.
+                if level < LAST_LEVEL then
+                    local nextLevel = level + 1
+                    log(string.format("'%s': trying again with %s", job.entry.name,
+                        nextLevel == 1 and "the baked normal layer left out"
+                        or nextLevel == 2 and "the hidden layers left out too"
+                        or "only the flattened Substance result"))
+                    attempt(nextLevel)
+                    return
+                end
             end
             importMaterials(ctx, done)
         else
@@ -381,7 +441,10 @@ local function importMaterials(ctx, done)
     attempt(0)
 end
 
-local function runImport(info, folder, fresh)
+-- sizing (nil when importing into the open project): { size = the project's
+-- size now, converted = the conversion's size, auto = true when the size may
+-- be lowered, reopen = function(size, onOpen) }.
+local function runImport(info, folder, fresh, sizing)
     local entries = nonNull(info.materials) or {}
     local byNorm = {}
     for _, e in ipairs(entries) do byNorm[norm(e.name)] = e end
@@ -417,9 +480,34 @@ local function runImport(info, folder, fresh)
         log("skipped (not used by any part of the model): " .. table.concat(skipped, ", "))
     end
 
+    local shrunk = nil     -- why the project is smaller than the conversion, once it is
     local function go()
         pp.setTimeLimit(600)
-        local ctx = { folder = folder, queue = queue, total = #queue, step = 0, fresh = fresh, notes = {} }
+        local jobs = {}
+        for i, q in ipairs(queue) do jobs[i] = q end
+        local ctx = { folder = folder, queue = jobs, total = #jobs, step = 0, fresh = fresh, notes = {},
+                      size = sizing and sizing.size or 0, canResize = sizing ~= nil }
+        if sizing and sizing.auto and fresh then
+            ctx.shrink = function(name, layers, need, free)
+                local from = sizing.size
+                sizing.size = math.floor(from / 2)
+                shrunk = shrunk or string.format(
+                    "at %d '%s' with its %d layers didn't fit this graphics card (%s)",
+                    from, tostring(name), layers, memoryText(need, free))
+                log(string.format("'%s' doesn't fit at %d; importing the whole project at %d instead, with every layer",
+                    tostring(name), from, sizing.size))
+                state.jobId = nil
+                sizing.reopen(sizing.size, go)
+            end
+        end
+        if shrunk then
+            ctx.notes[#ctx.notes + 1] = string.format(
+                "Imported at %d instead of %d: %s. Every layer is there. To keep %d, set Size to 'As converted'; "
+                .. "texture sets that don't fit then come in without some of their layers.",
+                sizing.size, sizing.converted, shrunk, sizing.converted)
+        end
+        local sizeNote = nonNull(info.sizeNote)
+        if type(sizeNote) == "string" then ctx.notes[#ctx.notes + 1] = sizeNote end
         if nonNull(info.partial) == true then
             -- the converter was closed before the end: it saves each texture set as it finishes
             ctx.notes[#ctx.notes + 1] = string.format(
@@ -438,6 +526,7 @@ local function runImport(info, folder, fresh)
             pp.layers.setActiveMaterial(queue[1] and queue[1].index or 0)
             if stopped then setStatus(stopped) return end
             local msg = "Done. Use File > Save As to keep it."
+            if sizing then msg = string.format("Done, at %d x %d. Use File > Save As to keep it.", sizing.size, sizing.size) end
             for _, line in ipairs(ctx.notes) do
                 log(line)
                 msg = msg .. " " .. line
@@ -526,24 +615,34 @@ local function startImport()
     else
         mesh = join(folder, nonNull(info.mesh) or "model.glb")
     end
-    setStatus("Opening " .. mesh .. " ...")
-    local ok, err = pp.project.openMesh(mesh, { resolution = tonumber(info.resolution) or 2048, force = state.force },
-        function(r)
-            if not r.ok then
-                state.busy = false
-                setStatus("Could not open the model: " .. tostring(r.error))
-                return
+    local converted = tonumber(info.resolution) or 2048
+    local sizing = { converted = converted, size = converted, auto = state.size == SIZE_AUTO }
+    local fixed = SIZE_VALUES[state.size]
+    if fixed then sizing.size = math.min(fixed, converted) end   -- bigger than the conversion adds nothing
+    local function open(size, force, onOpen)
+        setStatus(string.format("Opening %s at %d x %d ...", mesh, size, size))
+        local ok, err = pp.project.openMesh(mesh, { resolution = size, force = force },
+            function(r)
+                if not r.ok then
+                    state.busy = false
+                    setStatus("Could not open the model: " .. tostring(r.error))
+                    return
+                end
+                onOpen()
+            end)
+        if not ok then
+            state.busy = false
+            local e = tostring(err)
+            if e:lower():find("unsaved") then
+                e = e .. " - save your project first, or tick 'Discard unsaved changes'."
             end
-            runImport(info, folder, true)
-        end)
-    if not ok then
-        state.busy = false
-        local e = tostring(err)
-        if e:lower():find("unsaved") then
-            e = e .. " - save your project first, or tick 'Discard unsaved changes'."
+            setStatus("Could not start: " .. e)
         end
-        setStatus("Could not start: " .. e)
     end
+    -- Opening again at a smaller size replaces the project this import has
+    -- just made itself, so nothing of the user's is discarded by it.
+    sizing.reopen = function(size, onOpen) open(size, true, onOpen) end
+    open(sizing.size, state.force, function() runImport(info, folder, true, sizing) end)
 end
 
 local function cancelImport()
@@ -573,6 +672,10 @@ buildPanel = function()
                       onChange = function(t) state.mesh = trim(t) end }
     elseif state.meshSource == MESH_OPEN then
         w[#w + 1] = { type = "text", text = "Layers are added on top in the open project;\nnothing there is removed." }
+    end
+    if state.meshSource ~= MESH_OPEN then
+        w[#w + 1] = { type = "combo", label = "Size", value = state.size, options = SIZE_OPTIONS,
+                      onChange = function(i) state.size = i end }
     end
     w[#w + 1] = { type = "combo", label = "Result", value = state.flatMode,
                   options = { "Substance Result on top", "Substance Result hidden", "No Substance Result" },
@@ -618,14 +721,22 @@ end)
 log("Substance Importer " .. IMPORTER_VERSION .. " loaded - see Plugins > Substance Importer")
 
 -- Scripting entry point (batch imports, automated tests):
---   SppImporter.import("C:/path/Model (PawPaint import)", discardUnsaved)
+--   SppImporter.import("C:/path/Model (PawPaint import)", discardUnsaved [, size])
 -- Same as filling in the panel and clicking Import. Only discards unsaved
--- changes when `discardUnsaved` is true.
+-- changes when `discardUnsaved` is true. size: "auto", "converted", 2048,
+-- 1024 or 512 (the panel's Size option; left as it is when not given).
 SppImporter = {
     version = IMPORTER_VERSION,
-    import = function(folder, discardUnsaved)
+    import = function(folder, discardUnsaved, size)
         state.folder = folder
         state.force = discardUnsaved and true or false
+        if size == "auto" then state.size = SIZE_AUTO
+        elseif size == "converted" then state.size = SIZE_CONVERTED
+        elseif size ~= nil then
+            for i, v in pairs(SIZE_VALUES) do
+                if v == tonumber(size) then state.size = i end
+            end
+        end
         buildPanel()
         startImport()
     end,

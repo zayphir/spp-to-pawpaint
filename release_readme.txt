@@ -40,9 +40,12 @@ TIPS
   - Big projects take a while: a material with over a hundred layers at 4096 can need
     several minutes for "fitting masks". The window shows how far it is. If you close the
     converter early, the materials that were finished can still be imported.
-  - If PawPaint says there isn't enough video memory, the plugin imports fewer layers
-    and tells you. Close other programs that use the graphics card (Substance, games,
-    browsers) or convert at a lower resolution, then import again.
+  - PawPaint keeps every layer on the graphics card. A material with over a hundred
+    layers needs about 15 GB of video memory at 4096 and under 4 GB at 2048. Leave
+    Resolution (converter) and Size (plugin) on Auto: they use the largest size your
+    graphics card can import, keep every layer, and tell you when that is smaller than
+    the project. Closing other programs that use the graphics card (Substance, games,
+    browsers) frees video memory.
 
 OWN SUBSTANCE? (optional, for exact layers)
   See "Substance plugin (optional)": it exports every layer exactly, including
