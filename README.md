@@ -68,6 +68,12 @@ binary files.
   are in `materials/<set>/baked/`, ready to drop onto PawPaint fills or masks.
 - `report.txt` gives a match score per texture set and lists anything that
   could not be reproduced exactly.
+- `log.txt` is the whole run, line by line with times, written as it goes.
+  If a conversion is slow or fails, attach it to your GitHub issue.
+
+**Stopping early.** Every texture set is saved when it is finished. If you
+close the converter before the end, the folder can still be imported with the
+texture sets that were done, and the plugin tells you how many are missing.
 
 **Mesh choices in the plugin**
 - *Mesh from the .spp* (default). Rebuilt at its original size (`--mesh-units`, default cm).
@@ -91,7 +97,7 @@ bevel, generators and smart masks.
 **Speed and detail settings** (in the window's *Processing* box; remembered between runs):
 - **Engine.** Auto (default) uses your graphics card when one is found, and is always full detail. GPU or CPU can be forced.
 - **CPU detail.** *Fast* computes masks with lots of brush strokes at up to 2K and scales them up. *Full detail (lossless, slower)* works at full resolution everywhere.
-- **CPU cores.** 0 uses every core (limited only by free memory).
+- **CPU cores.** 0 uses every core (limited only by free memory). This also sets how many cores correct the masks against Substance's result, which is the longest step on texture sets with many layers; that step always runs on the CPU and reports its progress.
 - **Compare with Substance's result.** Writes match percentages to report.txt. Off by default because it's slower.
 
 **Command line:** `SppToPawPaint.exe file.spp --cli` plus any of:

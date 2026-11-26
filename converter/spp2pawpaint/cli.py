@@ -69,7 +69,90 @@ def convert(spp_path, out_dir=None, resolution=None, layers=True, flat=True, bak
     if out_dir is None:
         out_dir = os.path.join(os.path.dirname(spp_path), "%s (PawPaint import)" % stem)
     os.makedirs(out_dir, exist_ok=True)
+    # A conversion left here by an earlier run is being overwritten from now on.
+    for old in ("import.json", "report.txt"):
+        try:
+            os.remove(os.path.join(out_dir, old))
+        except OSError:
+            pass
+    log = RunLog(out_dir, log)
+    try:
+        return _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_units, substance_export,
+                        pawpaint_dir, handoff, log, progress, workers, engine, detail, t0)
+    except BaseException:
+        log.detail(traceback.format_exc())
+        raise
+    finally:
+        log.close()
 
+
+class RunLog:
+    """The run's log function, which also keeps everything in <output folder>/log.txt.
+    The file is written line by line, so it is there to send along when a run
+    is slow or fails. log.detail(text) goes to the file only."""
+
+    def __init__(self, out_dir, log):
+        self.log = log
+        self.t0 = time.time()
+        self.path = os.path.join(out_dir, "log.txt")
+        try:
+            self.f = open(self.path, "w", encoding="utf-8")
+        except OSError:
+            self.f = None
+        self.detail("SppToPawPaint %s, Python %s, %s" % (__version__, sys.version.split()[0], _system_line()))
+
+    def detail(self, text):
+        if self.f is None:
+            return
+        try:
+            for line in str(text).splitlines() or [""]:
+                self.f.write("[%8.1f s] %s\n" % (time.time() - self.t0, line))
+            self.f.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __call__(self, msg):
+        self.detail(msg)
+        self.log(msg)
+
+    def close(self):
+        if self.f is not None:
+            try:
+                self.f.close()
+            except OSError:
+                pass
+            self.f = None
+
+
+def _system_line():
+    """Operating system, CPU cores and memory, for the log."""
+    import platform
+    parts = ["%s %s" % (platform.system(), platform.release()), "%d CPU cores" % (os.cpu_count() or 1)]
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+                    (n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                                                      "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual",
+                                                      "ullAvailExtendedVirtual")]
+            ms = MS()
+            ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                parts.append("%.0f GB memory" % (ms.ullTotalPhys / 2.0 ** 30))
+        else:
+            parts.append("%.0f GB memory" % (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2.0 ** 30))
+    except Exception:
+        pass
+    return ", ".join(parts)
+
+
+def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_units, substance_export,
+             pawpaint_dir, handoff, log, progress, workers, engine, detail, t0):
+    log.detail("options: resolution %s, layers %s, result layer %s, baked maps %s, engine %s, detail %s, workers %s, "
+               "compare %s, mesh units %s" % (resolution or "auto", layers, flat, baked, engine, detail, workers or "all",
+                                              check, mesh_units))
     log("Reading %s" % os.path.basename(spp_path))
     proj = SppProject(spp_path)
     warnings = []
@@ -142,14 +225,28 @@ def convert(spp_path, out_dir=None, resolution=None, layers=True, flat=True, bak
                 log("  could not start worker processes (%s); using one core" % e)
                 pool = None
 
+    # Big mask fits run in their own worker processes (see refine.py).
+    from . import refine
+    refine.WORKERS = max(int(workers or 0), 0)
+
     taken = set()
     entries = []
+
+    def save_progress():
+        """Leave what is finished so far importable, in case the run is stopped."""
+        left = len(mats) - len(entries)
+        if left > 0:
+            note = ["The conversion was stopped early: %d of %d texture sets are in this folder. "
+                    "Convert again for the rest." % (len(entries), len(mats))]
+            _write_import(spp_path, out_dir, res, mesh_units, scale, entries, note + warnings, partial=len(mats))
+
     try:
         _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layers, flat, baked, check,
-                      export, export_dir, pool, log, progress, taken, use, lossless)
+                      export, export_dir, pool, log, progress, taken, use, lossless, save_progress)
     finally:
         if pool is not None:
             pool.close()
+        refine.close_pool()
     if progress:
         progress(len(mats), len(mats), "done")
     return _finish(proj, spp_path, out_dir, res, mesh_units, scale, entries, warnings, handoff, pawpaint_dir, log, t0)
@@ -168,7 +265,7 @@ def _heavy_masks(m, LY):
 
 
 def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layers, flat, baked, check,
-                  export, export_dir, pool, log, progress, taken, engine="cpu", lossless=False):
+                  export, export_dir, pool, log, progress, taken, engine="cpu", lossless=False, saved=None):
     for i, m in enumerate(mats):
         name = m.get("sceneMaterialName") or "Material"
         if progress:
@@ -206,29 +303,49 @@ def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layer
                          baked=sorted(mc.baked_files))
             how = ("exact layers from Substance" if exact_specs is not None else
                    "" if score is None else "rebuilt layers match Substance on %.1f%% of pixels" % (score * 100))
-            log("  %d layers%s (%.1fs)" % (entry["layers"], ", " + how if how else "", time.time() - t))
+            log("  %d layers%s (%s)" % (entry["layers"], ", " + how if how else "", _took(time.time() - t)))
             warnings.extend(mc.warnings)
             del mc
         except Exception as e:
             warnings.append("%s: could not be converted (%s)" % (name, e))
             log("  FAILED: %s" % e)
             traceback.print_exc()
+            if hasattr(log, "detail"):
+                log.detail(traceback.format_exc())
         entries.append(entry)
+        if saved:
+            saved()
 
 
-def _finish(proj, spp_path, out_dir, res, mesh_units, scale, entries, warnings, handoff, pawpaint_dir, log, t0):
+def _took(seconds):
+    return "%.1fs" % seconds if seconds < 120 else "%d min %02d s" % (seconds // 60, seconds % 60)
+
+
+def _write_import(spp_path, out_dir, res, mesh_units, scale, entries, warnings, partial=0):
+    """import.json and report.txt. `partial`: the number of texture sets the
+    project has, when the run isn't finished yet (the plugin then says so)."""
     info = {"format": "spp2pawpaint-import", "version": 1, "converter": __version__,
             "source": os.path.basename(spp_path), "resolution": res, "mesh": "model.glb",
             "meshUnits": mesh_units if scale != 1.0 else "raw",
             "materials": entries, "warnings": warnings}
-    with open(os.path.join(out_dir, "import.json"), "w", encoding="utf-8") as f:
+    if partial:
+        info["partial"] = True
+        info["setsTotal"] = int(partial)
+    # written next to it and swapped in, so a reader never sees half a file
+    path = os.path.join(out_dir, "import.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(info, f, indent=1)
+    os.replace(path + ".tmp", path)
     _write_report(out_dir, spp_path, res, entries, warnings)
+
+
+def _finish(proj, spp_path, out_dir, res, mesh_units, scale, entries, warnings, handoff, pawpaint_dir, log, t0):
+    _write_import(spp_path, out_dir, res, mesh_units, scale, entries, warnings)
     proj.close()
 
     if handoff:
         _handoff(out_dir, spp_path, entries, pawpaint_dir, log)
-    log("Done in %.0fs -> %s" % (time.time() - t0, out_dir))
+    log("Done in %s -> %s" % (_took(time.time() - t0), out_dir))
     if warnings:
         log("%d notes about things that could not be converted exactly, see report.txt" % len(warnings))
     return out_dir

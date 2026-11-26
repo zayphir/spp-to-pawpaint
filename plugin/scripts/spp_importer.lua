@@ -13,7 +13,7 @@
 --
 -- Unofficial community tool, not made or supported by PawWorks or Adobe.
 
-local IMPORTER_VERSION = "0.5.1"
+local IMPORTER_VERSION = "0.5.2"
 local PENDING_FILE = "scripts/spp_importer_pending.json"
 
 local MESH_SPP, MESH_OWN, MESH_OPEN = 1, 2, 3
@@ -420,6 +420,13 @@ local function runImport(info, folder, fresh)
     local function go()
         pp.setTimeLimit(600)
         local ctx = { folder = folder, queue = queue, total = #queue, step = 0, fresh = fresh, notes = {} }
+        if nonNull(info.partial) == true then
+            -- the converter was closed before the end: it saves each texture set as it finishes
+            ctx.notes[#ctx.notes + 1] = string.format(
+                "This conversion was stopped early: %d of %s texture sets are in this folder. "
+                .. "Convert the .spp again for the rest.",
+                #(nonNull(info.materials) or {}), tostring(nonNull(info.setsTotal) or "all"))
+        end
         if ctx.total == 0 then
             state.busy = false
             setStatus("Nothing to import: no texture set is matched to a material.")

@@ -129,18 +129,25 @@ class MaskPool:
     """Submit masks; results are fetched (blocking) when the converter needs them."""
 
     def __init__(self, path, workers=None):
+        self.path = path
+        self.workers = workers or default_workers()
+        self.ex = None
+        self.futures = {}   # key -> future
+        self._start()
+
+    def _start(self):
         import concurrent.futures as cf
         import multiprocessing as mp
-        self.workers = workers or default_workers()
         ctx = mp.get_context("spawn")
         self.ex = cf.ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx,
-                                         initializer=_init, initargs=(path,))
-        self.futures = {}   # key -> future
+                                         initializer=_init, initargs=(self.path,))
 
     def submit(self, key, mat, res, baked_urls, ancestors, layer, lossless=False, engine="cpu"):
         key = (mat, res, lossless, engine, key)
         if key in self.futures:
             return key
+        if self.ex is None:
+            self._start()
         payload = pickle.dumps((mat, res, dict(baked_urls), [geo_spec(a) for a in ancestors], layer, lossless,
                                 engine), protocol=pickle.HIGHEST_PROTOCOL)
         self.futures[key] = self.ex.submit(_task, payload)
@@ -153,5 +160,21 @@ class MaskPool:
         m, msgs = f.result()
         return (None if m is None else m.astype(np.float32)), msgs
 
+    def release(self):
+        """Stop the workers and drop their results once a texture set's masks
+        are all in. At 4K each worker holds gigabytes (the mesh's surface maps,
+        a GPU context) that it will never use again for this texture set, and
+        the mask fit that follows needs that memory. The workers start again
+        when the next texture set submits masks."""
+        ex, self.ex = self.ex, None
+        self.futures = {}
+        if ex is not None:
+            try:
+                ex.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+
     def close(self):
-        self.ex.shutdown(wait=False, cancel_futures=True)
+        ex, self.ex = self.ex, None
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)

@@ -28,6 +28,8 @@ WHAT YOU GET, PER MATERIAL
   - "Baked Normal (from Substance)": the baked normal map. Other baked maps (ID,
     curvature, position, thickness...) are in the converted folder under materials\<name>\baked.
   - report.txt in the converted folder lists anything that couldn't be converted exactly.
+  - log.txt in the converted folder is the whole run with times. If a conversion is slow
+    or fails, attach it to your GitHub issue.
 
 TIPS
   - Want shape keys? In the plugin choose Mesh: "My own model file" and give your FBX.
@@ -35,6 +37,9 @@ TIPS
   - Texture sets that don't match a material by name can be matched by hand in the panel.
   - Windows may warn about an unknown app the first time (it isn't code-signed):
     More info > Run anyway.
+  - Big projects take a while: a material with over a hundred layers at 4096 can need
+    several minutes for "fitting masks". The window shows how far it is. If you close the
+    converter early, the materials that were finished can still be imported.
   - If PawPaint says there isn't enough video memory, the plugin imports fewer layers
     and tells you. Close other programs that use the graphics card (Substance, games,
     browsers) or convert at a lower resolution, then import again.

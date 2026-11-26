@@ -24,9 +24,11 @@ on the stored sRGB values. Folders composite their children from empty, then
 merge like a layer.
 """
 
-import numpy as np
+import atexit
+import os
+import time
 
-from .masks import _dilate
+import numpy as np
 
 TOL = 8.0 / 255.0          # a texel "matches" when every channel is within this
 BLEND_MODES = ("Multiply", "Screen", "Overlay", "Add", "Soft Light", "Hard Light")
@@ -36,7 +38,20 @@ BLEND_MODES = ("Multiply", "Screen", "Overlay", "Add", "Soft Light", "Hard Light
 # such texels in the fix layer would leave dotted outlines when a layer is
 # recoloured later.
 TOL_FIX = 24.0 / 255.0
-TILE = 128                 # rows per processing tile
+# The fit works through the texture in strips of rows. Every step is per texel,
+# so the result doesn't depend on the strip height; it only decides speed.
+# Small strips keep the working arrays inside the CPU's cache (a 4K strip of
+# 128 rows was 524,288 texels: every one of the many small steps then streamed
+# megabytes through memory), and strips are what the worker processes share out.
+TILE_TEXELS = 65536        # texels per strip
+TILE_MAX_ROWS = 128
+# Big fits run their strips in worker processes (threads don't help: the steps
+# are many small numpy calls and Python runs one thread at a time between them).
+WORKERS = 0                # 0 = one per CPU core (cli sets it from --workers); 1 = this process only
+MAX_WORKERS = 32
+STRIPS_PER_WORKER = 4
+POOL_MIN_WORK = 12e6       # fitted layers x texels from which the worker processes pay off
+PROGRESS_SECONDS = 10.0    # how often a long fit says how far it is
 EVIDENCE_RADIUS = 8        # texels: how far a replayed mask counts as evidence
 # How strongly to prefer layers the replayed masks put there. Two layers can
 # look the same on screen (Lavender over Pink vs Lavender over a light-pink
@@ -67,6 +82,103 @@ MULTIPLY_PRIOR = (4.0 / 255.0) ** 2    # pull towards the replayed shading stren
 
 def _f(a):
     return a.astype(np.float32) / 255.0 if a.dtype == np.uint8 else a.astype(np.float32)
+
+
+def tile_rows(res):
+    return max(1, min(TILE_MAX_ROWS, TILE_TEXELS // max(int(res), 1)))
+
+
+def worker_count():
+    n = int(WORKERS) if WORKERS else (os.cpu_count() or 1)
+    n = max(1, min(n, MAX_WORKERS))
+    if n > 1:
+        try:        # a worker holds numpy and one strip: a few hundred MB at most
+            from .settings import available_memory_gb
+            n = max(1, min(n, int(available_memory_gb() * 0.6 / 0.3)))
+        except Exception:
+            pass
+    return n
+
+
+def _duration(seconds):
+    seconds = int(seconds + 0.5)
+    if seconds < 90:
+        return "%d s" % max(seconds, 1)
+    if seconds < 5400:
+        return "%d min" % ((seconds + 30) // 60)
+    return "%.1f h" % (seconds / 3600.0)
+
+
+class _Progress:
+    """Says how far a long step is, at most every PROGRESS_SECONDS."""
+
+    def __init__(self, log, what, steps):
+        self.log, self.what, self.steps = log, what, max(int(steps), 1)
+        self.t0 = self.last = time.time()
+
+    def __call__(self, done):
+        now = time.time()
+        if now - self.last >= PROGRESS_SECONDS and done < self.steps:
+            self.last = now
+            left = (now - self.t0) * (self.steps - done) / max(done, 1)
+            self.log("      %s: %d%% (about %s left)" % (self.what, 100 * done // self.steps, _duration(left)))
+
+
+_POOL = {"ex": None, "n": 0}
+
+
+def _pool(n):
+    if _POOL["ex"] is not None and _POOL["n"] == n:
+        return _POOL["ex"]
+    close_pool()
+    import concurrent.futures as cf
+    import multiprocessing as mp
+    _POOL["ex"] = cf.ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"))
+    _POOL["n"] = n
+    return _POOL["ex"]
+
+
+def close_pool():
+    """Stop the fit's worker processes (cli does this when a conversion ends)."""
+    ex, _POOL["ex"], _POOL["n"] = _POOL["ex"], None, 0
+    if ex is not None:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+atexit.register(close_pool)
+
+
+def run_strips(fn, jobs, workers=1, progress=None, log=None):
+    """fn(job) for every job, in worker processes when workers > 1. Returns
+    the results in job order. Strips don't depend on each other, so the
+    results are the same either way; if the processes can't be used, the work
+    is done here."""
+    out = [None] * len(jobs)
+    if workers > 1 and len(jobs) > 1:
+        try:
+            from concurrent.futures import as_completed
+            ex = _pool(workers)
+            futs = {ex.submit(fn, job): i for i, job in enumerate(jobs)}
+            done = 0
+            for f in as_completed(futs):
+                out[futs[f]] = f.result()
+                done += 1
+                if progress:
+                    progress(done)
+            return out
+        except Exception as e:      # e.g. the pool could not start, or a worker was killed
+            close_pool()
+            if log:
+                log("      (worker processes failed: %s; fitting on one core)" % e)
+            out = [None] * len(jobs)
+    for i, job in enumerate(jobs):
+        out[i] = fn(job)
+        if progress:
+            progress(i + 1)
+    return out
 
 
 def blend(mode, base, top):
@@ -170,6 +282,24 @@ class Leaf:
         """Most coverage this layer can reach (paint layers only where painted)."""
         return self.op * self.anc_op * self._part(self.pp_cov, y0, y1, n)
 
+    def strip(self, y0, y1, seen):
+        """This layer for rows y0:y1 only (its rows start at 0), small enough
+        to send to a worker process. `seen` shares arrays between the layers
+        of one strip (folder masks), so each is cut and sent once."""
+        def cut(a):
+            if isinstance(a, np.ndarray) and a.ndim >= 2:
+                if id(a) not in seen:
+                    seen[id(a)] = a[y0:y1]
+                return seen[id(a)]
+            return a
+        s = Leaf.__new__(Leaf)
+        s.exact, s.mode, s.op, s.kind = self.exact, self.mode, self.op, self.kind
+        s.anc_op, s.fittable, s.spec = self.anc_op, self.fittable, None
+        s.node = {"mask": cut(self.node.get("mask"))}
+        s.ancestors = [{"mask": cut(f.get("mask"))} for f in self.ancestors]
+        s.color, s.pp_cov, s.src = cut(self.color), cut(self.pp_cov), cut(self.src)
+        return s
+
 
 def collect(stack):
     """Leaves bottom -> top with their folder chain."""
@@ -190,9 +320,10 @@ BAKE_MIN_TEXELS = 256
 
 
 def _cols(leaves, y0, y1, n, baked):
+    """Colour of every layer for rows y0:y1. `baked`: {layer index: texture} replaces a layer's own colour."""
     cols = []
-    for L in leaves:
-        b = baked.get(id(L.node))
+    for i, L in enumerate(leaves):
+        b = baked.get(i)
         if b is not None:
             cols.append(_f(b[y0:y1]).reshape(-1, 3))
         elif L.color is None:
@@ -205,12 +336,106 @@ def _cols(leaves, y0, y1, n, baked):
 
 
 def _final_k(leaves, new, y0, y1, n):
+    """Coverage of every layer with the fitted masks `new` (one per layer, by index)."""
     return np.stack([
-        (L.op * L.anc_op * L._part(L.pp_cov, y0, y1, n) * _f(new[id(L.node)][y0:y1]).reshape(-1))
-        if L.color is not None else np.zeros(n, np.float32) for L in leaves], 0)
+        (L.op * L.anc_op * L._part(L.pp_cov, y0, y1, n) * _f(new[i][y0:y1]).reshape(-1))
+        if L.color is not None else np.zeros(n, np.float32) for i, L in enumerate(leaves)], 0)
+
+
+# -- the fit's three passes, one strip of rows at a time -----------------------------
+# A job is a dict with everything a strip needs, cut to its rows (see fit), so
+# the same function runs here or in a worker process.
+
+def _trust_strip(job):
+    """How often is each layer the one on top, and how often is the replayed picture wrong there?"""
+    leaves, res = job["leaves"], job["res"]
+    h = job["cache"].shape[0]
+    n = h * res
+    tn = np.zeros(len(leaves), np.int64)
+    tb = np.zeros(len(leaves), np.int64)
+    C = _f(job["cache"]).reshape(-1, 3)
+    inside = job["inside"].reshape(-1)
+    K = np.stack([np.clip(L.k0(0, h, n), 0, 1) for L in leaves], 0)
+    cols = _cols(leaves, 0, h, n, {})
+    err = np.abs(forward_flat(leaves, cols, K, n) - C).max(1)
+    dom, vis = dominant(leaves, K, n)
+    solid = inside & (vis >= 0.97) & (dom >= 0)
+    np.add.at(tn, dom[solid], 1)
+    np.add.at(tb, dom[solid & (err > TOL)], 1)
+    return tn, tb
+
+
+def _fit_strip(job):
+    """Pass 1: the fitted mask of every layer for this strip (uint8, layers x rows x width) and its counts."""
+    leaves, res = job["leaves"], job["res"]
+    h = job["cache"].shape[0]
+    n = h * res
+    nl = len(leaves)
+    dn = np.zeros(nl, np.int64)
+    db = np.zeros(nl, np.int64)
+    C = _f(job["cache"]).reshape(-1, 3)
+    inside = job["inside"].reshape(-1)
+    K = np.stack([L.k0(0, h, n) for L in leaves], 0)          # (nl, n)
+    cols = _cols(leaves, 0, h, n, {})
+    pred = forward_flat(leaves, cols, K, n)
+    bad = inside & (np.abs(pred - C).max(1) > TOL)
+    if bad.any() and job["normal"]:
+        K = solve(leaves, cols, K, C, bad, job["normal"], job["blends"], job["evidence"], 0, h, n, job["trusted"])
+    new = np.zeros((nl, h, res), np.uint8)
+    for li, L in enumerate(leaves):
+        if L.color is None or not L.fittable:
+            # not part of the fit: bake folder masks / image alpha as replayed
+            m = L.base_mask(0, h, n) * L._part(L.src, 0, h, n)
+        else:
+            den = L.op * L.anc_op * L._part(L.pp_cov, 0, h, n)
+            m = np.where(den > 1e-4, K[li] / np.maximum(den, 1e-4), 0.0)
+        new[li] = (np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8).reshape(h, res)
+    Kf = _final_k(leaves, new, 0, h, n)
+    err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
+    dom, vis = dominant(leaves, Kf, n)
+    solid = inside & (vis >= 0.97) & (dom >= 0)
+    np.add.at(dn, dom[solid], 1)
+    np.add.at(db, dom[solid & (err > TOL)], 1)
+    return new, int(inside.sum()), int(bad.sum()), dn, db
+
+
+def _check_strip(job):
+    """Pass 2: fill in the textures of baked layers, then measure what the fitted layers still get wrong."""
+    leaves, res, baked, blends = job["leaves"], job["res"], job["baked"], job["blends"]
+    h = job["cache"].shape[0]
+    n = h * res
+    C = _f(job["cache"]).reshape(-1, 3)
+    inside = job["inside"].reshape(-1)
+    Kf = _final_k(leaves, job["new"], 0, h, n)
+    if baked:
+        dom, vis = dominant(leaves, Kf, n)
+        mts = [_cols([leaves[mi]], 0, h, n, {})[0] for mi in blends]
+        for li in sorted(baked):
+            sel = inside & (dom == li) & (vis >= 0.97)
+            if sel.any():
+                chain = [(leaves[mi].mode, mts[q][sel], Kf[mi][sel]) for q, mi in enumerate(blends) if mi > li]
+                if not baked[li].flags.writeable:
+                    baked[li] = baked[li].copy()
+                blk = baked[li].reshape(-1, 3)
+                blk[sel] = (unapply(C[sel], chain) * 255 + 0.5).astype(np.uint8)
+    cols = _cols(leaves, 0, h, n, baked)
+    err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
+    err_rows = np.minimum(err * 255.0, 255).astype(np.uint8).reshape(h, res)
+    vis_rows = (np.clip(max_visibility(leaves, Kf, n), 0, 1) * 255).astype(np.uint8).reshape(h, res)
+    return int((inside & (err > TOL)).sum()), err_rows, vis_rows, baked
 
 
 def fit(mc, cache_rgb, coverage, log=print):
+    """Fit the masks (see _fit). The worker processes of a big fit are stopped
+    again afterwards: idle, they would hold memory the next texture set's mask
+    painting needs."""
+    try:
+        return _fit(mc, cache_rgb, coverage, log)
+    finally:
+        close_pool()
+
+
+def _fit(mc, cache_rgb, coverage, log=print):
     """Fit masks of MaterialConverter `mc` to `cache_rgb` (res x res x 3 uint8,
     sRGB). Returns (new_masks {id(node): float mask}, baked {id(node): uint8
     colour map}, residual_rgba or None, stats). Masks returned are what each
@@ -218,6 +443,7 @@ def fit(mc, cache_rgb, coverage, log=print):
     in). `baked` holds layers whose content isn't a flat colour in Substance
     (procedural materials, filtered content): their exact texture, taken from
     the final image where the layer shows."""
+    from .masks import _dilate
     res = mc.res
     leaves = [Leaf(n, anc, res) for n, anc in collect(mc._stack[0])]
     fit_idx = [i for i, L in enumerate(leaves) if L.fittable]
@@ -247,7 +473,8 @@ def fit(mc, cache_rgb, coverage, log=print):
     fit_idx = [i for i, L in enumerate(leaves) if L.fittable]
     normal = [i for i in fit_idx if leaves[i].mode == "Normal"]
     multiply = [i for i in fit_idx if leaves[i].mode in BLEND_MODES]   # blend layers with a fitted strength
-    new = {id(L.node): np.zeros((res, res), np.uint8) for L in leaves}
+    masks = [np.zeros((res, res), np.uint8) for L in leaves]      # the fitted mask of every layer
+    new = {id(L.node): m for L, m in zip(leaves, masks)}
     # evidence: where each replayed mask is (dilated), for tie-breaking
     # Evidence is where the replay makes a layer VISIBLE, not just where its
     # mask is: a layer completely covered by another one in the replay (e.g. a
@@ -273,62 +500,58 @@ def fit(mc, cache_rgb, coverage, log=print):
             y1 = min(res, y0 + 256)
             e[y0:y1] = (np.clip(leaves[i].k0(y0, y1, (y1 - y0) * res), 0, 1) * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
         evidence[i] = _dilate(e, EVIDENCE_RADIUS)
-    n_bad0 = n_in = 0
     covm = coverage > 0.5
-    dom_n = np.zeros(len(leaves), np.int64)
-    dom_bad = np.zeros(len(leaves), np.int64)
+    workers = worker_count() if len(fit_idx) * res * res >= POOL_MIN_WORK else 1
+    if workers == 1 and len(fit_idx) * res * res >= POOL_MIN_WORK and (os.cpu_count() or 1) > 1 and WORKERS != 1:
+        log("      (too little free memory for worker processes; fitting on one core)")
+    rows = tile_rows(res)
+    if workers > 1:     # several strips per worker, so that busy and empty rows even out
+        rows = max(1, min(rows, res // (workers * STRIPS_PER_WORKER)))
+    spans = [(y0, min(res, y0 + rows)) for y0 in range(0, res, rows)]
+    workers = min(workers, len(spans))
+
+    def jobs(**more):
+        """One job per strip: the layers, Substance's picture and the island mask, cut to its rows."""
+        out = []
+        for y0, y1 in spans:
+            job = {"res": res, "leaves": [L.strip(y0, y1, seen) for seen in [{}] for L in leaves],
+                   "cache": cache_rgb[y0:y1], "inside": covm[y0:y1]}
+            for k, v in more.items():
+                job[k] = v(y0, y1) if callable(v) else v
+            out.append(job)
+        return out
+
     # which exact layers does the replayed picture confirm?
     trusted = set()
     if TRUST_EXACT and any(L.exact for L in leaves):
-        tn = np.zeros(len(leaves), np.int64)
-        tb = np.zeros(len(leaves), np.int64)
-        for y0 in range(0, res, TILE):
-            y1 = min(res, y0 + TILE)
-            n = (y1 - y0) * res
-            C = _f(cache_rgb[y0:y1]).reshape(-1, 3)
-            inside = covm[y0:y1].reshape(-1)
-            K = np.stack([np.clip(L.k0(y0, y1, n), 0, 1) for L in leaves], 0)
-            cols = _cols(leaves, y0, y1, n, {})
-            err = np.abs(forward_flat(leaves, cols, K, n) - C).max(1)
-            dom, vis = dominant(leaves, K, n)
-            solid = inside & (vis >= 0.97) & (dom >= 0)
-            np.add.at(tn, dom[solid], 1)
-            np.add.at(tb, dom[solid & (err > TOL)], 1)
+        parts = run_strips(_trust_strip, jobs(), workers, log=log)
+        tn = sum(p[0] for p in parts)
+        tb = sum(p[1] for p in parts)
         for i, L in enumerate(leaves):
             if L.exact and L.fittable and (L.mode != "Normal" or tb[i] <= TRUST_MAX_BAD * max(int(tn[i]), 1)):
                 trusted.add(i)
     # pass 1: fit the masks
-    for y0 in range(0, res, TILE):
-        y1 = min(res, y0 + TILE)
-        n = (y1 - y0) * res
-        C = _f(cache_rgb[y0:y1]).reshape(-1, 3)
-        inside = covm[y0:y1].reshape(-1)
-        K = np.stack([L.k0(y0, y1, n) for L in leaves], 0)          # (nl, n)
-        cols = _cols(leaves, y0, y1, n, {})
-        pred = forward_flat(leaves, cols, K, n)
-        bad = inside & (np.abs(pred - C).max(1) > TOL)
-        n_in += int(inside.sum())
-        n_bad0 += int(bad.sum())
-        if bad.any() and normal:
-            K = solve(leaves, cols, K, C, bad, normal, multiply, evidence, y0, y1, n, trusted)
-        for li, L in enumerate(leaves):
-            if L.color is None or not L.fittable:
-                # not part of the fit: bake folder masks / image alpha as replayed
-                m = L.base_mask(y0, y1, n) * L._part(L.src, y0, y1, n)
-            else:
-                den = L.op * L.anc_op * L._part(L.pp_cov, y0, y1, n)
-                m = np.where(den > 1e-4, K[li] / np.maximum(den, 1e-4), 0.0)
-            new[id(L.node)][y0:y1] = (np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8).reshape(y1 - y0, res)
-        Kf = _final_k(leaves, new, y0, y1, n)
-        err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
-        dom, vis = dominant(leaves, Kf, n)
-        solid = inside & (vis >= 0.97) & (dom >= 0)
-        np.add.at(dom_n, dom[solid], 1)
-        np.add.at(dom_bad, dom[solid & (err > TOL)], 1)
+    if workers > 1:
+        log("      (%d layers to fit on %d CPU cores)" % (len(fit_idx), workers))
+    parts = run_strips(_fit_strip, jobs(normal=normal, blends=multiply, trusted=trusted,
+                                        evidence=lambda y0, y1: {i: e[y0:y1] for i, e in evidence.items()}),
+                       workers, _Progress(log, "fitting masks", len(spans)), log)
+    n_in = n_bad0 = 0
+    dom_n = np.zeros(len(leaves), np.int64)
+    dom_bad = np.zeros(len(leaves), np.int64)
+    for (y0, y1), (strip, a, b, dn, db) in zip(spans, parts):
+        for li in range(len(leaves)):
+            masks[li][y0:y1] = strip[li]
+        n_in += a
+        n_bad0 += b
+        dom_n += dn
+        dom_bad += db
+    del parts
     # layers whose own area is consistently off: their content isn't flat
     bake_ids = [li for li in normal
                 if dom_n[li] >= BAKE_MIN_TEXELS and dom_bad[li] > BAKE_SHARE * dom_n[li]]
     baked = {}
+    baked_i = {}                                                 # the same textures by layer index
     for li in bake_ids:
         L = leaves[li]
         if L.color.ndim == 1:
@@ -338,31 +561,22 @@ def fit(mc, cache_rgb, coverage, log=print):
             b = np.array(L.color[..., :3] if L.color.dtype == np.uint8 else
                          (np.clip(L.color[..., :3], 0, 1) * 255 + 0.5).astype(np.uint8))
         baked[id(L.node)] = b
+        baked_i[li] = b
     # pass 2: bake those textures, then put what's left in the detail fix
     resid = np.zeros((res, res, 4), np.uint8)
     n_bad1 = n_fix = 0
     err_img = np.zeros((res, res), np.uint8)
     vis_img = np.zeros((res, res), np.uint8)
-    for y0 in range(0, res, TILE):
-        y1 = min(res, y0 + TILE)
-        n = (y1 - y0) * res
-        C = _f(cache_rgb[y0:y1]).reshape(-1, 3)
-        inside = covm[y0:y1].reshape(-1)
-        Kf = _final_k(leaves, new, y0, y1, n)
-        if baked:
-            dom, vis = dominant(leaves, Kf, n)
-            mts = [_cols([leaves[mi]], y0, y1, n, {})[0] for mi in multiply]
-            for li in bake_ids:
-                sel = inside & (dom == li) & (vis >= 0.97)
-                if sel.any():
-                    chain = [(leaves[mi].mode, mts[q][sel], Kf[mi][sel]) for q, mi in enumerate(multiply) if mi > li]
-                    blk = baked[id(leaves[li].node)][y0:y1].reshape(-1, 3)
-                    blk[sel] = (unapply(C[sel], chain) * 255 + 0.5).astype(np.uint8)
-        cols = _cols(leaves, y0, y1, n, baked)
-        err = np.abs(forward_flat(leaves, cols, Kf, n) - C).max(1)
-        n_bad1 += int((inside & (err > TOL)).sum())
-        err_img[y0:y1] = np.minimum(err * 255.0, 255).astype(np.uint8).reshape(y1 - y0, res)
-        vis_img[y0:y1] = (np.clip(max_visibility(leaves, Kf, n), 0, 1) * 255).astype(np.uint8).reshape(y1 - y0, res)
+    parts = run_strips(_check_strip, jobs(blends=multiply, new=lambda y0, y1: [m[y0:y1] for m in masks],
+                                          baked=lambda y0, y1: {li: b[y0:y1] for li, b in baked_i.items()}),
+                       workers, _Progress(log, "checking the fitted layers", len(spans)), log)
+    for (y0, y1), (bad1, err_rows, vis_rows, bk) in zip(spans, parts):
+        n_bad1 += bad1
+        err_img[y0:y1] = err_rows
+        vis_img[y0:y1] = vis_rows
+        for li, rows_ in bk.items():
+            baked_i[li][y0:y1] = rows_
+    del parts
     # The edge allowance (TOL_FIX) is for anti-aliased edges between layers:
     # partly covered texels right next to fully covered ones. Wide soft areas
     # (glows, blurred shapes) get the strict tolerance; they used to pass as
@@ -433,11 +647,29 @@ def forward_flat(leaves, cols, K, n):
     return acc * acc_a[:, None] if OVER_BLACK else acc
 
 
+def _step(v, mode, t, k, nz=None):
+    """`v` after one blend layer (colour `t`, strength `k` per texel). Texels
+    where the strength is 0 are skipped: v + (blend - v) * 0 is v, so the
+    result is the same to the last bit as blending every texel. Returns a new
+    array, or `v` itself when the layer acts nowhere. `nz`: np.flatnonzero(k)
+    if the caller already has it."""
+    if nz is None:
+        nz = np.flatnonzero(k)
+    if len(nz) == 0:
+        return v
+    if len(nz) * 3 > len(k) * 2:
+        return v + (blend(mode, v, t) - v) * k[:, None]
+    out = v.copy()
+    vs = v[nz]
+    out[nz] = vs + (blend(mode, vs, t[nz]) - vs) * k[nz, None]
+    return out
+
+
 def apply_chain(base, chain):
     """Apply blend layers [(mode, colour (m,3), strength (m,))] in order."""
     v = base
     for mode, t, k in chain:
-        v = v + (blend(mode, v, t) - v) * k[:, None]
+        v = _step(v, mode, t, k)
     return v
 
 
@@ -451,17 +683,36 @@ def unapply(C, chain, iters=4):
 
 def _fit_strengths(base, Cb, chain_specs, k0):
     """Closed-form strengths of the blend layers above `base` (two passes of
-    coordinate descent; each layer's effect is ~linear in its strength)."""
+    coordinate descent; each layer's effect is ~linear in its strength).
+
+    For layer q the chain is evaluated with q off (F0) and fully on (F1), all
+    other layers at their current strength. The part of the chain below q is
+    the same for both and for the next q, so it is carried along in `v`
+    instead of being recomputed, and layers above q are skipped where their
+    strength is 0 (_step). Both give exactly the values of running the whole
+    chain every time, which is what this did before and what made texture
+    sets with many blend layers take hours (the work grew with the square of
+    their number, on every texel)."""
     ks = [np.array(k, np.float32) for k in k0]
+    nzs = [np.flatnonzero(k) for k in ks]
+    nb = len(chain_specs)
     for _ in range(2):
-        for q in range(len(chain_specs)):
-            lo = [(md, t, (ks[r] if r != q else np.zeros_like(ks[q]))) for r, (md, t) in enumerate(chain_specs)]
-            hi = [(md, t, (ks[r] if r != q else np.ones_like(ks[q]))) for r, (md, t) in enumerate(chain_specs)]
-            F0, F1 = apply_chain(base, lo), apply_chain(base, hi)
+        v = base                           # the chain below q, at the strengths fitted so far
+        for q in range(nb):
+            md, t = chain_specs[q]
+            b = blend(md, v, t)
+            F0 = v
+            F1 = v + (b - v)
+            for r in range(q + 1, nb):
+                mr, tr = chain_specs[r]
+                F0 = _step(F0, mr, tr, ks[r], nzs[r])
+                F1 = _step(F1, mr, tr, ks[r], nzs[r])
             d = F1 - F0
             num = ((Cb - F0) * d).sum(1) + MULTIPLY_PRIOR * k0[q]
             den = (d * d).sum(1) + MULTIPLY_PRIOR
             ks[q] = np.clip(num / np.maximum(den, 1e-12), 0, 1)
+            nzs[q] = np.flatnonzero(ks[q])
+            v = v + (b - v) * ks[q][:, None]
     return ks
 
 
@@ -682,8 +933,8 @@ def fit_scalars(mc, new, coverage, targets):
     for cid, T in targets.items():
         # who is on top for this channel: only layers that carry it count
         doms = np.full((res, res), -1, np.int32)
-        for y0 in range(0, res, TILE):
-            y1 = min(res, y0 + TILE)
+        for y0 in range(0, res, tile_rows(res)):
+            y1 = min(res, y0 + tile_rows(res))
             n = (y1 - y0) * res
             Kf = {}
             for li in carriers[cid]:

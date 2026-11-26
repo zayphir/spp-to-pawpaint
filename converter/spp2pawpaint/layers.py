@@ -204,6 +204,7 @@ class MaterialConverter:
         self._context = ""
         self._writer = None
         self._writes = []
+        self._discard_writes = False
         self._baked_urls = project.baked_maps(mat_doc)
         self._baked_cache = {}
         self.cache_albedo = None
@@ -224,6 +225,8 @@ class MaterialConverter:
     def _save(self, arr, path):
         """Write a PNG on a background thread (zlib releases the GIL). PNG is
         lossless at any compression level; level 1 is just much faster."""
+        if self._discard_writes:
+            return
         img = Image.fromarray(np.ascontiguousarray(arr))
         if self._writer is None:
             from concurrent.futures import ThreadPoolExecutor
@@ -857,7 +860,23 @@ class MaterialConverter:
             self._total = n_layers(self.items)
             self._submit_heavy_masks()
             self._walk(self.items, 0, [])
-        flat = self.flattened_layer() if include_flat else None
+            if self.pool is not None and self._pmask:
+                self.pool.release()     # every mask is in: free the workers' memory for the fit
+        flat = None
+        if include_flat:
+            flat = self.flattened_layer()
+        elif exact is None and include_layers and self.fit_to_result and self.mb is not None:
+            # No result layer wanted, but the masks are still fitted to Substance's
+            # result: read it without writing its images or declaring its channels.
+            # (Before 0.6.2, leaving the result layer out silently skipped the fit
+            # and the detail fix, so the layers came out as the raw replay.)
+            custom, notes = dict(self.custom), list(self.warnings)
+            self._discard_writes = True
+            try:
+                self.flattened_layer()
+            finally:
+                self._discard_writes = False
+                self.custom, self.warnings = custom, notes      # notes about a layer that isn't written
         if exact is None and include_layers and self.fit_to_result and self.mb is not None:
             self._add_black_base()
             self._normal_where_nothing_below(self._stack[0])
