@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.4 – 2026-11-26
+Two fixes for layers that came out wrong in PawPaint. Convert your project again to get them. Projects that use neither thing convert exactly as with 0.6.3. The plugin is unchanged (0.6.3).
+
+- **Layers that only showed through the 'Detail fix' layer.** Substance stores blending per channel. A folder or layer whose settings named only some channels (say, height and normal turned down to 0 %) had those settings applied to the whole layer, so a folder could come into PawPaint at 0 % opacity with everything in it invisible. The picture still looked right, because the 'Detail fix' layer painted over it, but the layers were not doing the work: hiding or recolouring them changed nothing. Each channel now gets its own blend mode and opacity, and channels without a setting keep 100 %. On the project this was found on, the layers alone went from 44 % of the texture matching Substance to 97 % in PawPaint, and the 'Detail fix' layer shrank from half the texture to about 1 %.
+- **'Random height bumps' on projects with height** (embossed lines, stitches, scales). PawPaint adds a layer's height to the layers below unless that layer's height is set to Replace. The 'Substance Result' layer sat on layers that already had the height, so bumps came out twice as high in patches, with a ridge around each patch. Its height is now set to Replace, so the height is exactly Substance's.
+- **Smoother height with the result layer hidden.** The 'Detail fix' layer corrected height only where the layers were clearly off, which left a step around every corrected patch. It now corrects much finer and stores height in 16 bits instead of 8.
+
 ## 0.6.3 – 2026-11-26
 The size now follows your graphics card, so big projects come in with all their layers instead of only the flattened result. Nothing about how layers are converted has changed: at the same size, every file the converter writes for the test projects is identical to 0.6.2's.
 

@@ -153,6 +153,19 @@ def _f(a):
     return a.astype(np.float32) / 255.0 if a.dtype == np.uint8 else a.astype(np.float32)
 
 
+HEIGHT_FIX_TOL = 1.0 / 255.0      # the layers' height may be this far from Substance's before the detail fix takes over
+
+
+def never_flat(h):
+    """A height image (0..1, 0.5 = flat) for a layer whose height replaces
+    what is below it. PawPaint's Replace leaves a texel alone when the layer's
+    height there is exactly flat (within 1/65535 of 0.5), so flat texels are
+    moved by 2.5/65535, far too little to see, and the layer then replaces
+    everywhere."""
+    h = np.clip(np.asarray(h, np.float32), 0, 1)
+    return np.where(np.abs(h - 0.5) < 2.0 / 65535.0, np.float32(0.5 + 2.5 / 65535.0), h)
+
+
 class MaterialConverter:
     def __init__(self, project, geo, mat_doc, scene_index, res, outdir, log, pool=None,
                  engine="cpu", lossless=False):
@@ -356,6 +369,7 @@ class MaterialConverter:
                        "displayed); the 'Substance Result' layer was rebuilt from the converted layers "
                        "and is approximate")
         maps = {}
+        replace = {}
         has_rough = S.CH_ROUGHNESS in cache
         for flag, img in cache.items():
             if flag == S.CH_GLOSSINESS and not has_rough:
@@ -397,7 +411,12 @@ class MaterialConverter:
                 h = img[..., 0].astype(np.float32)
                 h = h if approximate else 0.5 + 0.5 * h
                 self.result_arrays[cid] = np.clip(h, 0, 1)
-                maps[cid] = self._write_gray(h, tag, bits=16)
+                # PawPaint ADDS a layer's height to what is below it unless
+                # the layer's height is set to Replace. This layer sits on
+                # layers that already give Substance's height, so without
+                # Replace every bump showed twice as high while it was visible.
+                maps[cid] = self._write_gray(never_flat(h), tag, bits=16)
+                replace[cid] = {"blendMode": "Replace", "opacity": 1.0}
             else:
                 v = img[..., 0]
                 v = _f(v) if v.dtype == np.uint8 else v.astype(np.float32)
@@ -409,53 +428,97 @@ class MaterialConverter:
             b = self.baked_map("normal")
             maps["normal"] = self._write_rgb(b[..., :3], "result_normal")
         name = "Substance Result (approximate)" if approximate else "Substance Result (flattened)"
-        return {"type": "Paint", "name": name, "visible": True, "channels": maps,
+        spec = {"type": "Paint", "name": name, "visible": True, "channels": maps,
                 "normalConvention": self.normal_convention, "spp": {"role": "flattened"}}
+        if replace:
+            spec["channelOverrides"] = replace
+        return spec
 
     # -- layer stack ------------------------------------------------------------
+    def _set_channels(self):
+        """PawPaint ids of the channels this texture set has."""
+        cids = getattr(self, "_cids", None)
+        if cids is None:
+            cids = set()
+            for c in ((self.doc.get("stacks") or [{}])[0].get("channels") or []):
+                flag = (c or {}).get("type")
+                if flag in CHANNEL_MAP:
+                    cids.add(CHANNEL_MAP[flag][0])
+            self._cids = cids
+        return cids
+
     def _blend(self, layer):
-        """Return (blendMode, opacity, channelOverrides, disabled channel ids)."""
+        """Return (blendMode, opacity, channelOverrides, disabled channel ids,
+        per-channel (blend, opacity) where a channel differs from the layer's).
+
+        Substance stores blending per channel: a list of entries, each naming
+        the channels it is for. A channel that no entry names keeps its
+        default, 100 %. A PawPaint layer has one blend mode and opacity plus
+        per-channel overrides, so the layer's own are the base colour's and
+        every channel that differs gets an override; a channel set to
+        'Disable' is switched off.
+
+        (Until 0.6.3 the FIRST entry was taken for the whole layer. In a test
+        project the main colour folder's only entries set height and normal to
+        0 %, so the folder came out at 0 % opacity: everything in it was
+        invisible in PawPaint and had to be painted over by the detail fix.)"""
         entries = layer.get("perChannelBlending") or []
         if not entries:
-            return "Normal", 1.0, None, set()
+            return "Normal", 1.0, None, set(), {}
         ALL = 0xFFFFFFFFFFFFFFFF
-        main = None
-        disabled, overrides = set(), {}
+        base = None                           # an entry for every channel, if there is one
+        per = {}
         for e in entries:
             mode = int(e.get("blendingMode", BLEND_NORMAL))
             op = float(e.get("opacity", 1.0))
             bits = int(e.get("channelTypes", 0))
-            every = (bits & ALL) == ALL       # 64-bit masks, or 128-bit ones (Substance 12.2+)
-            if every or main is None:
-                main = (mode, op) if every or main is None else main
-            if not every:
+            if (bits & ALL) == ALL:           # 64-bit masks, or 128-bit ones (Substance 12.2+)
+                base = (mode, op)
+            else:
                 for flag, (cid, _, _) in CHANNEL_MAP.items():
                     if bits & flag:
-                        if mode == BLEND_DISABLE:
-                            disabled.add(cid)
-                        else:
-                            overrides[cid] = (mode, op)
-        mode, op = main
-        if mode == BLEND_DISABLE:
-            return "Normal", 0.0, None, set(c for c, _, _ in CHANNEL_MAP.values())
-        if mode not in BLEND_NAMES:
-            self._warn("blend mode '%s' is not in PawPaint, Normal used"
-                       % SUBSTANCE_BLEND_LABELS.get(mode, "unknown (id %s)" % mode))
-        name = BLEND_NAMES.get(mode, "Normal")
-        ov = {}
-        for cid, (m, o) in overrides.items():
-            if (m, o) == (mode, op):
-                continue
+                        per[cid] = (mode, op)
+        cids = set(self._set_channels()) | set(per) | {"albedo"}
+        fallback = base if base is not None else (None, 1.0)     # None: the channel's default mode
+        eff = {cid: per.get(cid, fallback) for cid in cids}
+        disabled = set(cid for cid, (m, _) in eff.items() if m == BLEND_DISABLE)
+        if not (cids - disabled):
+            return "Normal", 0.0, None, set(c for c, _, _ in CHANNEL_MAP.values()), {}
+        if base is not None and base[0] == BLEND_DISABLE:
+            # 'Disable' for everything except the channels named on their own
+            disabled |= set(c for c, _, _ in CHANNEL_MAP.values()) - set(per)
+
+        def mapped(cid, m, o, warn=True):
+            """Substance's mode for one channel as PawPaint's (blend, opacity)."""
             if cid == "normal":
-                ov[cid] = {"blendMode": "Normal", "opacity": o}
-            elif cid in ("height", "displacement"):
-                ov[cid] = {"blendMode": "Replace" if m in (1, 25) else "Add", "opacity": o}
+                return "Normal", o            # PawPaint always lays normals over each other
+            if cid in ("height", "displacement"):
+                return ("Replace" if m == 1 else "Add"), o       # PawPaint adds height, or replaces it
+            if m is not None and m not in BLEND_NAMES and warn:
+                self._warn("blend mode '%s'%s is not in PawPaint, Normal used"
+                           % (SUBSTANCE_BLEND_LABELS.get(m, "unknown (id %s)" % m),
+                              "" if cid == "albedo" else " (%s)" % cid))
+            return BLEND_NAMES.get(m, "Normal"), o
+
+        lead = "albedo" if "albedo" not in disabled else sorted(cids - disabled)[0]
+        name, op = mapped(lead, *eff[lead])
+        if lead != "albedo" and lead in ("normal", "height", "displacement"):
+            name = "Normal"
+        ov, chan = {}, {}
+        for cid in sorted(cids - disabled):
+            if cid == lead:
+                continue
+            nm, o = mapped(cid, *eff[cid])
+            if cid in ("height", "displacement"):
+                differs = nm == "Replace" or o != op
+            elif cid == "normal":
+                differs = o != op
             else:
-                if m not in BLEND_NAMES:
-                    self._warn("blend mode '%s' (%s) is not in PawPaint, Normal used"
-                               % (SUBSTANCE_BLEND_LABELS.get(m, "unknown (id %s)" % m), cid))
-                ov[cid] = {"blendMode": BLEND_NAMES.get(m, "Normal"), "opacity": o}
-        return name, op, (ov or None), disabled
+                differs = (nm, o) != (name, op)
+            if differs:
+                ov[cid] = {"blendMode": nm, "opacity": o}
+                chan[cid] = (nm, o)
+        return name, op, (ov or None), disabled, chan
 
     def _mask_entry(self, layer, tag):
         if self.mb is None:
@@ -819,7 +882,7 @@ class MaterialConverter:
 
     def _convert_one(self, L, name, parent_idx, path):
         tag = "%03d_%s" % (self._count, _safe(name))
-        mode, op, ov, disabled = self._blend(L)
+        mode, op, ov, disabled, chan = self._blend(L)
         spec = {"name": name, "visible": bool(L.get("enabled", True)), "opacity": op,
                 "blendMode": mode, "spp": {"uid": L.get("uid"), "tag": "#spp%d" % self._count}}
         if parent_idx:
@@ -839,7 +902,9 @@ class MaterialConverter:
         if masks:
             spec["masks"] = masks
         node = {"mask": mask_arr, "op": op if spec["visible"] else 0.0, "disabled": disabled, "mode": mode,
-                "spec": spec, "tag": tag}
+                "spec": spec, "tag": tag,
+                # channels whose blend or opacity is not the layer's own (see _blend)
+                "chan": {c: (nm, o if spec["visible"] else 0.0) for c, (nm, o) in chan.items()}}
         # 'exact': the mask comes only from steps that are rebuilt exactly
         # (fills, images, projections, polygon fills), with no brush strokes
         # and no warnings. The fitter leaves such layers alone (refine.py).
@@ -1052,11 +1117,17 @@ class MaterialConverter:
         if fix:
             channels, content, over = {}, {}, {}
             for cid, (v, a) in fix.items():
-                rgbv = v if v.ndim == 3 else np.repeat(_u8(v)[..., None], 3, -1)
-                channels[cid] = self._write_rgb(rgbv, "detail_fix_%s" % cid, a)
-                content[cid] = (_u8(v), a)
                 if cid in ("height", "displacement"):
+                    # Height replaces what is below wherever it isn't exactly
+                    # flat (PawPaint ignores a layer's coverage for height), so
+                    # it needs no alpha and can keep 16 bits: an 8-bit height
+                    # shows as fine steps once PawPaint lights it.
+                    channels[cid] = self._write_gray(v, "detail_fix_%s" % cid, bits=16)
                     over[cid] = {"blendMode": "Replace", "opacity": 1.0}
+                else:
+                    rgbv = v if v.ndim == 3 else np.repeat(_u8(v)[..., None], 3, -1)
+                    channels[cid] = self._write_rgb(rgbv, "detail_fix_%s" % cid, a)
+                content[cid] = (_u8(v), a)
             spec = {"type": "Paint", "name": "Detail fix (from Substance)", "visible": True,
                     "opacity": 1.0, "blendMode": "Normal", "channels": channels,
                     "spp": {"tag": "#sppfix", "role": "detail_fix"}}
@@ -1115,7 +1186,6 @@ class MaterialConverter:
         channel, so it never hides another channel)."""
         out = {}
         cov = self.coverage() > 0.5
-        tol = 8.0 / 255.0
         for cid in ("roughness", "metallic", "height"):
             target = self.result_arrays.get(cid)
             if target is None:
@@ -1123,13 +1193,18 @@ class MaterialConverter:
             comp = self.composite(cid)
             if comp is None:
                 comp = np.full(target.shape, 0.5 if cid == "height" else 0.0, np.float32)
+            # Height is lit from its slope, so the edge of a corrected patch
+            # shows as a ridge as high as the tolerance: 8/255 gave 'random
+            # bumps' around every patch (reported on a project with embossed
+            # lines). It gets a tolerance PawPaint's lighting can't show.
+            tol = HEIGHT_FIX_TOL if cid == "height" else 8.0 / 255.0
             bad = cov & (np.abs(comp - target) > tol)
             if bad.any():
                 bad = _dilate(bad.astype(np.uint8), 1) > 0
                 v = np.where(bad, target, 0.5 if cid == "height" else 0.0).astype(np.float32)
                 if cid == "height":
                     # Replace only acts where the value isn't exactly flat
-                    v = np.where(bad & (np.abs(v - 0.5) < 1.5 / 255), 0.5 + 1.5 / 255, v)
+                    v = np.where(bad, never_flat(v), np.float32(0.5))
                 out[cid] = (v, (bad * 255).astype(np.uint8))
         target = self.result_arrays.get("normal")
         detail = self.result_arrays.get("normal_layers")
@@ -1159,6 +1234,24 @@ class MaterialConverter:
         parent_of = {id(sp): (self.layers[sp["parent"] - 1] if sp.get("parent") else None) for sp in self.layers}
         gone = set()
 
+        def mute(nodes, off):
+            for k in nodes:
+                k["disabled"] = set(k.get("disabled") or ()) | off
+                for c in off:
+                    (k.get("chan") or {}).pop(c, None)
+                sp = k.get("spec")
+                if sp is not None:
+                    info = sp.setdefault("spp", {})
+                    info["disabledChannels"] = sorted(set(info.get("disabledChannels") or ()) | off)
+                    ovr = sp.get("channelOverrides")
+                    if ovr:
+                        for c in off:
+                            ovr.pop(c, None)
+                        if not ovr:
+                            sp.pop("channelOverrides", None)
+                if "children" in k:
+                    mute(k["children"], off)
+
         def walk(nodes, parent_spec):
             out = []
             for n in nodes:
@@ -1171,6 +1264,12 @@ class MaterialConverter:
                 kids = walk(n["children"], parent_spec if dissolve else spec)
                 if dissolve:
                     gone.add(id(spec))
+                    # the folder goes, so what it switched off for everything in
+                    # it (a channel at 0 %, or 'Disable') is switched off in each
+                    # of its layers instead
+                    off = set(n.get("disabled") or ()) | set(c for c, (_, o) in (n.get("chan") or {}).items() if o <= 0)
+                    if off:
+                        mute(kids, off)
                     for k in kids:
                         if k.get("spec") is not None and parent_of.get(id(k["spec"])) is spec:
                             parent_of[id(k["spec"])] = parent_spec
@@ -1229,12 +1328,19 @@ class MaterialConverter:
 
         signed = cid in ("height", "displacement")
 
+        def blend_of(n):
+            """(blend, opacity) of node n for this channel."""
+            own = (n.get("chan") or {}).get(cid)
+            return own if own is not None else (n.get("mode", "Normal"), n["op"])
+
         def render(nodes):
             if signed:
                 # PawPaint: h = clamp(acc + (content - 0.5) * opacity * mask)
                 h = np.full((res, res), 0.5, np.float32)
                 for n in nodes:
                     if "children" in n:
+                        if cid in (n.get("disabled") or ()):
+                            continue
                         c = render(n["children"])
                         a = np.ones((res, res), np.float32)
                     else:
@@ -1243,7 +1349,7 @@ class MaterialConverter:
                             continue
                         c, a = r
                         touched[0] = True
-                    k = a * n["op"]
+                    k = a * blend_of(n)[1]
                     if n["mask"] is not None:
                         k = k * _f(n["mask"])
                     h = np.clip(h + (c - 0.5) * k, 0, 1)
@@ -1252,6 +1358,8 @@ class MaterialConverter:
             al = np.zeros((res, res), np.float32)
             for n in nodes:
                 if "children" in n:
+                    if cid in (n.get("disabled") or ()):
+                        continue
                     c, a = render(n["children"])
                 else:
                     r = content_of(n)
@@ -1259,10 +1367,10 @@ class MaterialConverter:
                         continue
                     c, a = r
                     touched[0] = True
-                k = a * n["op"]
+                mode, op_c = blend_of(n)
+                k = a * op_c
                 if n["mask"] is not None:
                     k = k * _f(n["mask"])
-                mode = n.get("mode", "Normal")
                 # PawPaint's merge (layer_merge.frag), on stored values
                 b = _blend_pixels(mode, col, c) if cid != "normal" else c
                 a_out = k + al * (1 - k)
