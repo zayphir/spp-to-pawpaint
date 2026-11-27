@@ -59,6 +59,23 @@ def pick_resolution(materials, requested=None):
     return min(ALLOWED_RES, key=lambda r: abs(r - best))
 
 
+def native_size(material):
+    """A texture set's own size in Substance, as a size PawPaint has (512 to 4096)."""
+    lg = (material.get("resolutionLog2") or [11, 11])[0]
+    own = min(max(2 ** int(lg), 512), 4096)
+    return min(ALLOWED_RES, key=lambda r: abs(r - own))
+
+
+def set_sizes(materials, requested=None):
+    """The size each texture set is converted at: its own. A resolution that
+    was asked for is the largest any of them gets; a set that is smaller in
+    Substance keeps its size, since enlarging it adds nothing. (PawPaint 1.28
+    gives each material its own texture size. Older versions open the project
+    at the largest and scale the smaller images up themselves.)"""
+    top = min(ALLOWED_RES, key=lambda r: abs(r - requested)) if requested else None
+    return [min(native_size(m), top) if top else native_size(m) for m in materials]
+
+
 def convert(spp_path, out_dir=None, resolution=None, layers=True, flat=True, baked=True, check=False,
             mesh_units="cm", substance_export=None, pawpaint_dir=None, handoff=True,
             log=print, progress=None, workers=0, engine="auto", detail="fast"):
@@ -168,7 +185,6 @@ def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_uni
     scene = proj.scene
     geo = Geometry(scene)
     mats = [m for m in proj.materials if m]
-    res = pick_resolution(mats, resolution)
     log("  %d texture sets, %d mesh parts, %d triangles" % (len(mats), len(scene.parts), len(geo.T)))
     if any(m.get("useUVTiles") for m in mats):
         warnings.append("This is a UDIM project; only UV tile 1001 is converted for now.")
@@ -215,8 +231,15 @@ def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_uni
 
     # The size: the project's own, unless its layers can't be imported at that
     # size on this PC's graphics card (see vram.py).
-    res, memory, size_note = _plan_size(mats, scene, res, resolution, use, layers, log)
-    log("  importing at %dx%d" % (res, res))
+    sizes, memory, size_note = _plan_sizes(mats, scene, resolution, use, layers, log)
+    in_model = [s for m, s in zip(mats, sizes) if (m.get("sceneMaterialName") or "Material") in scene.material_names]
+    res = max(in_model or sizes or [pick_resolution(mats, resolution)])     # the project's size: its largest material
+    if len(set(sizes)) > 1:
+        log("  importing at up to %dx%d, each texture set at its own size (%s)"
+            % (res, res, ", ".join("%s %d" % (m.get("sceneMaterialName") or "Material", s)
+                                   for m, s in zip(mats, sizes))))
+    else:
+        log("  importing at %dx%d" % (res, res))
 
     # Heavy brush masks run in worker processes: on the CPU route one per core,
     # on the GPU route a few (each with its own GPU context) so the CPU-side
@@ -253,7 +276,7 @@ def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_uni
                           size_note=size_note)
 
     try:
-        _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layers, flat, baked, check,
+        _convert_sets(proj, geo, scene, mats, sizes, out_dir, entries, warnings, layers, flat, baked, check,
                       export, export_dir, pool, log, progress, taken, use, lossless, save_progress)
     finally:
         if pool is not None:
@@ -265,45 +288,58 @@ def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_uni
                    memory, size_note)
 
 
-def _plan_size(mats, scene, res, requested, use, layers, log):
-    """(size, video memory of this PC, note). Says what PawPaint will need for
-    the layers; when no size was asked for and they can't be imported at the
-    project's size on this graphics card, picks the largest size at which
-    they can, which also converts several times faster."""
+def _plan_sizes(mats, scene, requested, use, layers, log):
+    """(the size of each texture set, video memory of this PC, note). Every
+    texture set is converted at its own size. Says what PawPaint will need for
+    the layers; when no size was asked for and they can't all be imported on
+    this graphics card, the sets that need the most are converted a size
+    smaller until they can, which also converts several times faster."""
+    sizes = set_sizes(mats, requested)
     if not layers:
-        return res, None, None
+        return sizes, None, None
     try:
         memory = vram.video_memory(use_opengl=(use == "gpu"))
     except Exception:
         memory = None
     # the texture sets the model uses, in the order the plugin imports them (the model's materials)
     order = list(scene.material_names)
-    used = sorted((m for m in mats if (m.get("sceneMaterialName") or "Material") in order),
-                  key=lambda m: order.index(m.get("sceneMaterialName") or "Material")) or mats
 
-    def needs(size):
-        return [vram.guess_mb(m, size) for m in used]
+    def name(i):
+        return mats[i].get("sceneMaterialName") or "Material"
+    used = sorted((i for i in range(len(mats)) if name(i) in order), key=lambda i: order.index(name(i))) \
+        or list(range(len(mats)))
 
+    def needs(at):
+        return [vram.guess_mb(mats[i], at[k]) for k, i in enumerate(used)]
+
+    own = [sizes[i] for i in used]
     if memory:
         log("  graphics card: %s" % vram.describe(memory))
-    log("  PawPaint will need roughly %s of video memory for these layers at %dx%d (%s at %dx%d)"
-        % (vram.gb(sum(needs(res))), res, res, vram.gb(sum(needs(res // 2))), res // 2, res // 2))
+    top = max(own)
+    log("  PawPaint will need roughly %s of video memory for these layers at %s (%s a size smaller)"
+        % (vram.gb(sum(needs(own))), "%dx%d" % (top, top) if len(set(own)) == 1 else "their own sizes, up to %dx%d" % (top, top),
+           vram.gb(sum(needs([s // 2 for s in own])))))
     budget = vram.budget_mb(memory)
-    if budget is None or vram.fits(needs(res), budget):
-        return res, memory, None
+    if budget is None or vram.fits(needs(own), budget):
+        return sizes, memory, None
     if requested:
-        log("  That is more than this graphics card can give it. The PawPaint plugin will then import at a smaller "
-            "size; converting at that size (Resolution: Auto) would also be several times faster.")
-        return res, memory, None
-    size = vram.auto_size(res, needs, budget)
-    if size == res:
-        return res, memory, None
-    note = ("Converted at %dx%d instead of the project's %dx%d: at %d PawPaint needs roughly %s of video memory "
-            "for these layers and this graphics card can give it about %s, so it could not import them. "
-            "To convert at %d anyway, choose that resolution instead of Auto."
-            % (size, size, res, res, res, vram.gb(sum(needs(res))), vram.gb(budget), res))
+        log("  That is more than this graphics card can give it. The PawPaint plugin will then import what doesn't "
+            "fit at a smaller size; converting at that size (Resolution: Auto) would also be several times faster.")
+        return sizes, memory, None
+    fitted = vram.auto_sizes(own, lambda k, s: vram.guess_mb(mats[used[k]], s), budget)
+    lowered = [(used[k], own[k], fitted[k]) for k in range(len(used)) if fitted[k] != own[k]]
+    if not lowered:
+        return sizes, memory, None
+    for i, _, new in lowered:
+        sizes[i] = new
+    what = ", ".join("'%s' at %dx%d instead of %dx%d" % (name(i), new, new, old, old) for i, old, new in lowered)
+    note = ("Converted %s: at %s own size PawPaint needs roughly %s of video memory for these layers and this "
+            "graphics card can give it about %s, so it could not import them. %sTo convert at the project's own "
+            "sizes anyway, choose a resolution instead of Auto."
+            % (what, "its" if len(lowered) == 1 else "their", vram.gb(sum(needs(own))), vram.gb(budget),
+               "The other texture sets keep their sizes. " if len(lowered) < len(used) else ""))
     log("  " + note)
-    return size, memory, note
+    return sizes, memory, note
 
 
 def _heavy_masks(m, LY):
@@ -318,9 +354,13 @@ def _heavy_masks(m, LY):
                 st.append(L["subStack"].get("items") or [])
 
 
-def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layers, flat, baked, check,
+def _convert_sets(proj, geo, scene, mats, sizes, out_dir, entries, warnings, layers, flat, baked, check,
                   export, export_dir, pool, log, progress, taken, engine="cpu", lossless=False, saved=None):
+    """`sizes`: the size of each texture set (see set_sizes), or one size for all."""
+    if not isinstance(sizes, (list, tuple)):
+        sizes = [sizes] * len(mats)
     for i, m in enumerate(mats):
+        res = sizes[i]
         name = m.get("sceneMaterialName") or "Material"
         if progress:
             progress(i, len(mats), name)
@@ -329,7 +369,7 @@ def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layer
         if scene_index is None:
             warnings.append("%s: this texture set isn't used by any part of the model in the .spp; "
                             "it is skipped when importing onto that model" % name)
-        log("Texture set '%s'" % name)
+        log("Texture set '%s'%s" % (name, "" if len(set(sizes)) == 1 else " (%dx%d)" % (res, res)))
         if hasattr(log, "detail"):
             try:
                 from .settings import available_memory_gb
@@ -339,7 +379,7 @@ def _convert_sets(proj, geo, scene, mats, res, out_dir, entries, warnings, layer
         t = time.time()
         entry = {"name": name, "bundle": "materials/%s" % folder, "layers": 0, "match": None,
                  "nativeResolution": 2 ** int((m.get("resolutionLog2") or [11])[0]),
-                 "inMesh": scene_index is not None}
+                 "resolution": res, "inMesh": scene_index is not None}
         try:
             mc = MaterialConverter(proj, geo, m, scene_index, res, os.path.join(out_dir, "materials", folder), log, pool,
                                    engine=engine, lossless=lossless)
@@ -425,10 +465,12 @@ def _finish(proj, spp_path, out_dir, res, mesh_units, scale, entries, warnings, 
         _handoff(out_dir, spp_path, entries, pawpaint_dir, log)
     if needs:
         budget = vram.budget_mb(memory)
-        line = "PawPaint needs %s of video memory for these layers at %dx%d" % (vram.gb(sum(needs)), res, res)
+        own = {e.get("resolution", res) for e in entries if e.get("videoMemoryMB") and e.get("inMesh", True)}
+        line = "PawPaint needs %s of video memory for these layers at %s" % (
+            vram.gb(sum(needs)), "%dx%d" % (res, res) if own <= {res} else "their own sizes (up to %dx%d)" % (res, res))
         if budget is not None and not vram.fits(needs, budget):
-            line += (" and this graphics card can give it about %s, so the plugin will import them at a smaller size "
-                     "(%s at %dx%d)" % (vram.gb(budget), vram.gb(sum(needs) / 4.0), res // 2, res // 2))
+            line += (" and this graphics card can give it about %s, so the plugin will import what doesn't fit at a "
+                     "smaller size (%s with every texture set a size smaller)" % (vram.gb(budget), vram.gb(sum(needs) / 4.0)))
         log(line + ".")
     log("Done in %s -> %s" % (_took(time.time() - t0), out_dir))
     if warnings:
@@ -446,6 +488,9 @@ def _write_report(out_dir, spp_path, res, entries, warnings, size_note=None):
         for e in entries:
             how = ("exact layers from Substance" if e.get("exact") else
                    "" if e.get("match") is None else "rebuilt layers match Substance on %.1f%% of pixels" % (e["match"] * 100))
+            size = e.get("resolution")
+            if size and size != res:
+                how = ("%dx%d   " % (size, size) + how).rstrip()
             f.write("%-28s %3d layers   %s\n" % (e["name"], e["layers"], how))
             if e.get("baked"):
                 f.write("%-28s baked maps: %s (in %s/baked/)\n" % ("", ", ".join(e["baked"]), e["bundle"]))
@@ -454,12 +499,19 @@ def _write_report(out_dir, spp_path, res, entries, warnings, size_note=None):
             f.write("\nVideo memory PawPaint needs to import the layers (it keeps every layer on the graphics card):\n")
             for e in entries:
                 if e.get("videoMemoryMB") and e.get("inMesh", True):
-                    f.write("  %-26s %8s at %d, %s at %d\n" % (e["name"], vram.gb(e["videoMemoryMB"]), res,
-                                                                vram.gb(e["videoMemoryMB"] / 4.0), res // 2))
-            f.write("  %-26s %8s at %d, %s at %d\n" % ("all of them", vram.gb(sum(needs)), res,
-                                                        vram.gb(sum(needs) / 4.0), res // 2))
-            f.write("  When a texture set doesn't fit, the PawPaint plugin imports the project at the next smaller\n"
-                    "  size instead (its 'Size' option), which keeps every layer.\n")
+                    own = e.get("resolution", res)
+                    f.write("  %-26s %8s at %d, %s at %d\n" % (e["name"], vram.gb(e["videoMemoryMB"]), own,
+                                                                vram.gb(e["videoMemoryMB"] / 4.0), own // 2))
+            same = {e.get("resolution", res) for e in entries if e.get("videoMemoryMB") and e.get("inMesh", True)} <= {res}
+            if same:
+                f.write("  %-26s %8s at %d, %s at %d\n" % ("all of them", vram.gb(sum(needs)), res,
+                                                            vram.gb(sum(needs) / 4.0), res // 2))
+            else:
+                f.write("  %-26s %8s at these sizes, %s a size smaller\n" % ("all of them", vram.gb(sum(needs)),
+                                                                             vram.gb(sum(needs) / 4.0)))
+            f.write("  When a texture set doesn't fit, the PawPaint plugin imports it at the next smaller size\n"
+                    "  instead (its 'Size' option), which keeps every layer. Before PawPaint 1.28 it has to do\n"
+                    "  that for the whole project.\n")
         f.write("\nNotes (%d):\n" % len(warnings))
         for w in warnings:
             f.write("  - %s\n" % w)

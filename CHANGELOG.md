@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0 – 2026-11-27
+Uses what PawPaint 1.28 added for plugins. Update both parts: the zip has the new exe and the new plugin (0.7.0; the exe offers to install it). Everything still works with older PawPaint versions, the way it did before.
+
+- **Every texture set keeps its own size.** Until now the whole project was converted and imported at the size of its largest texture set. Now a 1024 eye texture stays 1024 next to a 4096 body: conversions are faster, the files smaller, and PawPaint needs less video memory (2.3 GB instead of 4.6 GB for a test project with five texture sets). PawPaint 1.28 gives each material its own texture size; older versions open the project at the largest size and scale the smaller images up themselves.
+- **Only the material that doesn't fit gets smaller.** The converter's Resolution *Auto* now makes just the texture sets that need the most video memory a size smaller, not the whole project. In PawPaint 1.28 the plugin's Size *Auto* asks PawPaint whether a material's layers fit before importing them, and makes only that material a size smaller when they don't. Before, it had to be refused first and then open the whole project again at a smaller size.
+- **A resolution you pick yourself** is now the largest size any texture set gets. A set that is smaller in Substance is no longer enlarged to it, which added nothing.
+- **Plugin with PawPaint 1.28: layers are found by their id** after an import, instead of by a tag that was put in their names for a moment.
+- **Plugin with PawPaint 1.28: emission and custom-channel values are set directly** on fill layers. Each used to need a solid-colour image, which costs 85 MB of video memory per layer at 4096.
+- **Plugin with PawPaint 1.28: Browse buttons** for the converted folder and for your own model file.
+
 ## 0.6.6 – 2026-11-27
 Fixes projects saved with the current Substance 3D Painter (12.2, the '2026' version). If materials came into PawPaint blank, or without their 'Substance Result' layer, convert the project again with this version. The plugin is unchanged (0.6.5).
 

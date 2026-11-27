@@ -13,16 +13,31 @@
 --
 -- Unofficial community tool, not made or supported by PawWorks or Adobe.
 
-local IMPORTER_VERSION = "0.6.5"
+local IMPORTER_VERSION = "0.7.0"
 local PENDING_FILE = "scripts/spp_importer_pending.json"
 
 local MESH_SPP, MESH_OWN, MESH_OPEN = 1, 2, 3
 -- 'Size' option: the size of the textures in the PawPaint project. PawPaint
 -- keeps every layer on the graphics card, and what a layer takes goes with
--- the texture area, so a project that doesn't fit at 4096 needs a quarter of
--- the video memory at 2048. Auto starts at the size of the conversion and
--- goes down a size when PawPaint refuses a texture set, instead of leaving
--- layers out. PawPaint scales the converted images itself.
+-- the texture area, so a material that doesn't fit at 4096 needs a quarter of
+-- the video memory at 2048. Auto starts at the sizes of the conversion and
+-- makes a material a size smaller when its layers don't fit, instead of
+-- leaving layers out. PawPaint scales the converted images itself.
+--
+-- What this PawPaint can do. 1.28 added the calls below; on an older PawPaint
+-- the plugin works as it did before (one size for the whole project, a
+-- refused import instead of a question, layers found again by name, a
+-- solid-colour image where a value can't be set, no Browse buttons).
+local function has(t, name)
+    return type(t) == "table" and type(t[name]) == "function"
+end
+local CAN = {
+    materialSize = has(pp.project, "setMaterialResolution") and has(pp.project, "materialResolution"),
+    estimate = has(pp.import, "estimate"),     -- 'would this import fit?' without importing
+    ids = has(pp.layers, "indexOf"),           -- the import says which layers it made
+    values = has(pp.fill, "setValue"),         -- a value for emission and custom channels
+    dialog = type(pp.dialog) == "table" and has(pp.dialog, "selectFolder") and has(pp.dialog, "openFile"),
+}
 local SIZE_AUTO, SIZE_CONVERTED = 1, 2
 local SIZE_OPTIONS = { "Auto (fit graphics card)", "As converted", "2048", "1024", "512" }
 local SIZE_VALUES = { [3] = 2048, [4] = 1024, [5] = 512 }
@@ -147,8 +162,8 @@ local function wantLayer(l, level, hidden)
     return state.layers
 end
 
--- Returns spec, meta (tag -> layer info) and the number of hidden layers left
--- out, for one bundle.
+-- Returns spec, meta (layer info by its place in spec, and by its tag) and
+-- the number of hidden layers left out, for one bundle.
 local function buildSpec(dir, manifest, level)
     local spec, meta = {}, {}
     local newIndex = {}
@@ -164,9 +179,13 @@ local function buildSpec(dir, manifest, level)
             local tag = nonNull(spp.tag) or ("#spp" .. i)
             local name = tostring(nonNull(l.name) or "Layer")
             if #name > 200 then name = name:sub(1, 200) end
+            -- A value PawPaint can set itself needs no solid-colour image.
+            local solid = CAN.values and nonNull(l.type) == "Fill" and nonNull(spp.solid) or nil
+            if type(solid) ~= "table" then solid = nil end
             local s = {
                 type = nonNull(l.type),
-                name = name .. " " .. tag,
+                -- without layer ids the layers are found again by this tag in their name
+                name = CAN.ids and name or (name .. " " .. tag),
                 visible = nonNull(l.visible),
                 opacity = nonNull(l.opacity),
                 blendMode = nonNull(l.blendMode),
@@ -194,7 +213,8 @@ local function buildSpec(dir, manifest, level)
                 for id, p in pairs(ch) do
                     p = nonNull(p)
                     -- 'Height' unticked: no layer brings a height image
-                    if type(p) == "string" and (state.height or not HEIGHT_CHANNELS[id]) then
+                    if type(p) == "string" and (state.height or not HEIGHT_CHANNELS[id])
+                            and not (solid and nonNull(solid[id]) ~= nil) then
                         s.channels[id] = join(dir, p)
                     end
                 end
@@ -217,9 +237,11 @@ local function buildSpec(dir, manifest, level)
             end
             spec[#spec + 1] = s
             newIndex[i] = #spec
-            meta[tag] = { name = name, type = s.type, fill = nonNull(spp.fill),
-                          disabled = nonNull(spp.disabledChannels),
-                          only = nonNull(spp.onlyChannels), maps = nonNull(spp.mapChannels) }
+            local info = { name = name, type = s.type, fill = nonNull(spp.fill),
+                           disabled = nonNull(spp.disabledChannels), solid = solid,
+                           only = nonNull(spp.onlyChannels), maps = nonNull(spp.mapChannels) }
+            meta[tag] = info
+            meta[#spec] = info
         end
     end
     return spec, meta, leftHidden
@@ -282,35 +304,75 @@ local function applyFill(i, fill, mapChannels)
     if not state.height then pp.fill.setChannelEnabled(i, "height", false) end
 end
 
-local function finishMaterial(matIndex, before, meta, removeDefaults)
+-- The values behind a fill's solid-colour images (emission, custom channels),
+-- set directly: {channel = number or {r, g, b}}.
+local function applySolid(i, solid)
+    for id, v in pairs(solid) do
+        v = nonNull(v)
+        local ok = false
+        if type(v) == "number" then
+            ok = pp.fill.setValue(i, id, v)
+        elseif type(v) == "table" then
+            ok = pp.fill.setValue(i, id, v[1], v[2], v[3])
+        end
+        if ok ~= false then pp.fill.setChannelEnabled(i, id, true) end
+    end
+end
+
+local function finishLayer(i, info)
+    local isFill = pp.layers.type(i) == "Fill"
+    if isFill and (info.fill or info.maps or not state.height) then
+        applyFill(i, info.fill, info.maps)
+    end
+    if isFill and info.solid then applySolid(i, info.solid) end
+    if isFill and type(info.only) == "table" then
+        local only = asSet(info.only)
+        for _, id in ipairs(FILL_CHANNELS) do
+            if not only[id] then pp.fill.setChannelEnabled(i, id, false) end
+        end
+    end
+    if type(info.disabled) == "table" then
+        for _, id in ipairs(info.disabled) do
+            if isFill then pp.fill.setChannelEnabled(i, id, false)
+            else pp.layers.setChannelOpacity(i, id, 0) end
+        end
+    end
+end
+
+-- ids: the ids of the layers the import made, in the order of its spec
+-- (PawPaint 1.28+), or nil; then the layers are found by the tag in their name.
+local function finishMaterial(matIndex, before, meta, removeDefaults, ids)
     pp.layers.setActiveMaterial(matIndex)
     local count = pp.layers.count()
     local found, leftovers = 0, {}
-    for i = count - 1, 0, -1 do
-        local nm = pp.layers.name(i) or ""
-        local tag = nm:match(" (#spp%w+)$")
-        local info = tag and meta[tag]
-        if info then
-            local isFill = pp.layers.type(i) == "Fill"
-            if isFill and (info.fill or info.maps or not state.height) then
-                applyFill(i, info.fill, info.maps)
-            end
-            if isFill and type(info.only) == "table" then
-                local only = asSet(info.only)
-                for _, id in ipairs(FILL_CHANNELS) do
-                    if not only[id] then pp.fill.setChannelEnabled(i, id, false) end
+    if ids then
+        local mine = {}
+        for k = 1, #ids do
+            local id = ids[k]
+            local i = (type(id) == "number" and id ~= 0) and pp.layers.indexOf(id) or -1
+            if i >= 0 then
+                mine[i] = true
+                if meta[k] then
+                    finishLayer(i, meta[k])
+                    found = found + 1
                 end
             end
-            if type(info.disabled) == "table" then
-                for _, id in ipairs(info.disabled) do
-                    if isFill then pp.fill.setChannelEnabled(i, id, false)
-                    else pp.layers.setChannelOpacity(i, id, 0) end
-                end
+        end
+        for i = count - 1, 0, -1 do
+            if not mine[i] then leftovers[#leftovers + 1] = i end
+        end
+    else
+        for i = count - 1, 0, -1 do
+            local nm = pp.layers.name(i) or ""
+            local tag = nm:match(" (#spp%w+)$")
+            local info = tag and meta[tag]
+            if info then
+                finishLayer(i, info)
+                pp.layers.setName(i, info.name)
+                found = found + 1
+            elseif not tag then
+                leftovers[#leftovers + 1] = i
             end
-            pp.layers.setName(i, info.name)
-            found = found + 1
-        elseif not tag then
-            leftovers[#leftovers + 1] = i
         end
     end
     -- In a fresh project, remove the default layer(s) so the stack is exactly
@@ -373,12 +435,52 @@ local function importMaterials(ctx, done)
         end
     end
     pp.layers.setActiveMaterial(job.index)
+    -- This material's own size, in a project this import made (PawPaint 1.28+).
+    if ctx.setSize and job.size and not ctx.setSize(job, job.size) then
+        job.size = nil      -- it stays at the project's size
+    end
     local before = pp.layers.count()
     local full = 0
     local short = nil      -- memoryText of the first refusal
     local advice = "Close other programs that use the graphics card (Substance Painter, games, browsers)"
         .. (ctx.canResize and ", or pick a smaller Size, then import again." or ", then import again.")
-    local function attempt(level)
+    local attempt
+    -- The layers don't fit the free video memory (need, free: MB, or nil when
+    -- PawPaint didn't say): make this material a size smaller if that is
+    -- allowed, else the whole project, else leave something out.
+    local function tooBig(level, need, free)
+        short = short or memoryText(need, free)
+        if level == 0 and ctx.auto and ctx.setSize and job.size and job.size > MIN_AUTO_SIZE then
+            local from = job.size
+            local to = math.floor(from / 2)
+            if ctx.setSize(job, to) then
+                job.size = to
+                job.shrunk = job.shrunk or { from = from, layers = full, why = memoryText(need, free) }
+                log(string.format("'%s' doesn't fit at %d (%s); importing this material at %d instead, with every layer",
+                    job.entry.name, from, memoryText(need, free), to))
+                attempt(0)
+                return
+            end
+        end
+        -- Before 1.28: the whole project one size smaller, which also keeps
+        -- every layer (a quarter of the memory per step).
+        if level == 0 and ctx.shrink and ctx.size > MIN_AUTO_SIZE then
+            ctx.shrink(job.entry.name, full, need, free)
+            return
+        end
+        -- Otherwise try again with less instead of leaving it empty.
+        if level < LAST_LEVEL then
+            local nextLevel = level + 1
+            log(string.format("'%s': trying again with %s", job.entry.name,
+                nextLevel == 1 and "the baked normal layer left out"
+                or nextLevel == 2 and "the hidden layers left out too"
+                or "only the flattened Substance result"))
+            attempt(nextLevel)
+            return
+        end
+        importMaterials(ctx, done)
+    end
+    attempt = function(level)
         local spec, meta, leftHidden = buildSpec(dir, manifest, level)
         if level == 0 then full = #spec end
         if #spec == 0 then
@@ -388,13 +490,42 @@ local function importMaterials(ctx, done)
             importMaterials(ctx, done)
             return
         end
-        setStatus(string.format("Importing '%s' into '%s' (%d of %d, %d layers)...", job.entry.name,
-            tostring(pp.mesh.materialName(job.index)), ctx.step, ctx.total, #spec))
+        -- Ask first (PawPaint 1.28+): the import's own check, nothing is queued.
+        if CAN.estimate then
+            local est = pp.import.estimate(job.index, spec)
+            if type(est) == "table" and est.fits == false then
+                local need = tonumber(est.bytesNeeded) and est.bytesNeeded / 1048576 or nil
+                local free = tonumber(est.bytesFree) and est.bytesFree / 1048576 or nil
+                log(string.format("'%s' would not fit: %s", job.entry.name, memoryText(need, free)))
+                tooBig(level, need, free)
+                return
+            end
+        end
+        setStatus(string.format("Importing '%s' into '%s' (%d of %d, %d layers%s)...", job.entry.name,
+            tostring(pp.mesh.materialName(job.index)), ctx.step, ctx.total, #spec,
+            job.size and string.format(", %d x %d", job.size, job.size) or ""))
         local id, err = pp.import.layers(job.index, spec, function(r)
             state.jobId = nil
             if r.ok then
-                local n = finishMaterial(job.index, before, meta, ctx.fresh)
+                local ids = nil
+                if CAN.ids then
+                    ids = nonNull(r.layerIds)
+                    if type(ids) ~= "table" then
+                        ids = {}
+                        log(string.format("'%s': PawPaint did not say which layers it made, so their fill values "
+                            .. "could not be set", job.entry.name))
+                    end
+                end
+                local n = finishMaterial(job.index, before, meta, ctx.fresh, ids)
                 log(string.format("'%s': %d layers imported", job.entry.name, n))
+                if job.shrunk then
+                    ctx.notes[#ctx.notes + 1] = string.format(
+                        "'%s' was imported at %d instead of %d: at %d its %d layers didn't fit this graphics card (%s). "
+                        .. "Every layer is there. To keep %d, set Size to 'As converted'; a material that doesn't fit "
+                        .. "then comes in without some of its layers.",
+                        job.entry.name, job.size, job.shrunk.from, job.shrunk.from, job.shrunk.layers, job.shrunk.why,
+                        job.shrunk.from)
+                end
                 -- say what a fallback left out
                 if level == 1 and #spec < full then
                     ctx.notes[#ctx.notes + 1] = string.format(
@@ -423,25 +554,8 @@ local function importMaterials(ctx, done)
             -- PawPaint 1.27+ refuses an import that needs more video memory
             -- than is free.
             if why:lower():find("video memory", 1, true) then
-                local need = tonumber(why:match("needs about (%d+) MB"))
-                local free = tonumber(why:match("about (%d+) MB is free"))
-                short = short or memoryText(need, free)
-                -- First choice: the whole project one size smaller, which
-                -- keeps every layer (a quarter of the memory per step).
-                if level == 0 and ctx.shrink and ctx.size > MIN_AUTO_SIZE then
-                    ctx.shrink(job.entry.name, full, need, free)
-                    return
-                end
-                -- Otherwise try again with less instead of leaving it empty.
-                if level < LAST_LEVEL then
-                    local nextLevel = level + 1
-                    log(string.format("'%s': trying again with %s", job.entry.name,
-                        nextLevel == 1 and "the baked normal layer left out"
-                        or nextLevel == 2 and "the hidden layers left out too"
-                        or "only the flattened Substance result"))
-                    attempt(nextLevel)
-                    return
-                end
+                tooBig(level, tonumber(why:match("needs about (%d+) MB")), tonumber(why:match("about (%d+) MB is free")))
+                return
             end
             importMaterials(ctx, done)
         else
@@ -494,10 +608,22 @@ local function runImport(info, folder, fresh, sizing)
     local function go()
         pp.setTimeLimit(600)
         local jobs = {}
-        for i, q in ipairs(queue) do jobs[i] = q end
+        for i, q in ipairs(queue) do
+            jobs[i] = q
+            -- the size this material gets: the texture set's own, at most the project's
+            q.shrunk = nil
+            q.size = sizing and math.min(tonumber(nonNull(q.entry.resolution)) or sizing.converted, sizing.size) or nil
+        end
         local ctx = { folder = folder, queue = jobs, total = #jobs, step = 0, fresh = fresh, notes = {},
-                      size = sizing and sizing.size or 0, canResize = sizing ~= nil }
-        if sizing and sizing.auto and fresh then
+                      size = sizing and sizing.size or 0, canResize = sizing ~= nil,
+                      auto = sizing ~= nil and sizing.auto }
+        if sizing and fresh and CAN.materialSize then
+            -- every material at its own size; never in a project the user already had open
+            ctx.setSize = function(job, size)
+                if pp.project.materialResolution(job.index) == size then return true end
+                return pp.project.setMaterialResolution(job.index, size) == true
+            end
+        elseif sizing and sizing.auto and fresh then
             ctx.shrink = function(name, layers, need, free)
                 local from = sizing.size
                 sizing.size = math.floor(from / 2)
@@ -536,7 +662,21 @@ local function runImport(info, folder, fresh, sizing)
             pp.layers.setActiveMaterial(queue[1] and queue[1].index or 0)
             if stopped then setStatus(stopped) return end
             local msg = "Done. Use File > Save As to keep it."
-            if sizing then msg = string.format("Done, at %d x %d. Use File > Save As to keep it.", sizing.size, sizing.size) end
+            if sizing then
+                local sizes, differ = {}, false
+                for _, q in ipairs(queue) do
+                    if q.size then
+                        sizes[#sizes + 1] = string.format("%s %d", tostring(q.entry.name), q.size)
+                        if q.size ~= sizing.size then differ = true end
+                    end
+                end
+                if ctx.setSize and differ then
+                    msg = string.format("Done, each material at its own size (%s). Use File > Save As to keep it.",
+                        table.concat(sizes, ", "))
+                else
+                    msg = string.format("Done, at %d x %d. Use File > Save As to keep it.", sizing.size, sizing.size)
+                end
+            end
             for _, line in ipairs(ctx.notes) do
                 log(line)
                 msg = msg .. " " .. line
@@ -672,6 +812,18 @@ buildPanel = function()
     w[#w + 1] = { type = "text", text = "Or paste a converted folder (or the .spp), then press Enter:" }
     w[#w + 1] = { type = "inputText", label = "Folder", value = state.folder,
                   onChange = function(t) state.folder = t; state.pendingText = nil; setStatus("Folder set. Click Import.") end }
+    if CAN.dialog then
+        w[#w + 1] = { type = "button", label = "Browse for the converted folder...", onClick = function()
+            local start = trim(state.folder)
+            local p = pp.dialog.selectFolder({ title = "The converted folder: \"<project> (PawPaint import)\"",
+                                               path = start ~= "" and start or nil })
+            if type(p) == "string" and p ~= "" then
+                state.folder = p
+                state.pendingText = nil
+                setStatus("Folder set. Click Import.")
+            end
+        end }
+    end
     w[#w + 1] = { type = "separator" }
     w[#w + 1] = { type = "combo", label = "Mesh", value = state.meshSource,
                   options = { "Mesh from the .spp", "My own model file", "The project open now" },
@@ -680,6 +832,16 @@ buildPanel = function()
         w[#w + 1] = { type = "text", text = "Your FBX/OBJ/GLB (keeps shape keys). Materials are\nmatched to texture sets by name." }
         w[#w + 1] = { type = "inputText", label = "Model", value = state.mesh,
                       onChange = function(t) state.mesh = trim(t) end }
+        if CAN.dialog then
+            w[#w + 1] = { type = "button", label = "Browse for your model...", onClick = function()
+                local p = pp.dialog.openFile({ title = "Your model",
+                                               filters = { "Models", "*.fbx *.obj *.glb *.gltf", "All Files", "*" } })
+                if type(p) == "string" and p ~= "" then
+                    state.mesh = p
+                    buildPanel()
+                end
+            end }
+        end
     elseif state.meshSource == MESH_OPEN then
         w[#w + 1] = { type = "text", text = "Layers are added on top in the open project;\nnothing there is removed." }
     end

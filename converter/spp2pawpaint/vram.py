@@ -253,6 +253,22 @@ def auto_size(native, needs_at, budget):
     return size
 
 
+def auto_sizes(sizes, need_at, budget):
+    """Sizes for the texture sets (in import order) that all fit `budget`:
+    `sizes` as they are, with the set that needs the most made a size smaller,
+    again and again, until they fit or nothing above MIN_AUTO_SIZE is left.
+    `need_at(i, size)` gives set i's need in MB. PawPaint 1.28 gives every
+    material its own texture size, so only what doesn't fit has to shrink."""
+    sizes = list(sizes)
+    while not fits([need_at(i, s) for i, s in enumerate(sizes)], budget):
+        big = [i for i, s in enumerate(sizes) if s > MIN_AUTO_SIZE]
+        if not big:
+            break
+        i = max(big, key=lambda k: need_at(k, sizes[k]))
+        sizes[i] //= 2
+    return sizes
+
+
 def gb(mb):
     """A number of megabytes for a message: '15.1 GB', or '165 MB' under one gigabyte."""
     return "%d MB" % round(mb) if mb < 1000 else "%.1f GB" % (mb / 1024.0)

@@ -77,7 +77,7 @@ texture sets that were done, and the plugin tells you how many are missing.
 
 **Mesh choices in the plugin**
 - *Mesh from the .spp* (default). Rebuilt at its original size (`--mesh-units`, default cm).
-- *My own model file*. Your FBX, OBJ or GLB, which keeps shape keys (Substance doesn't store them).
+- *My own model file*. Your FBX, OBJ or GLB, which keeps shape keys (Substance doesn't store them). With PawPaint 1.28 there is a *Browse* button for it, and one for the converted folder.
 - *The project open now*. Open your model in PawPaint first; the layers are added on top.
 
 Texture sets are matched to materials by name, ignoring case, spaces, `_`,
@@ -88,22 +88,29 @@ and (from 1.27) refuses a texture set that needs more video memory than is
 free. What a layer takes goes with the texture area: a layer with a mask is
 about 117 MB at 4096 and a quarter of that at 2048. So a texture set with 120
 layers needs about 15 GB at 4096 and under 4 GB at 2048. Both parts work the
-size out for you:
+sizes out for you:
+- **Every texture set keeps its own size.** A 1024 eye texture stays 1024
+  next to a 4096 body. That converts faster and takes less video memory than
+  bringing everything to the largest size. PawPaint 1.28 gives each material
+  its own texture size; older versions open the project at the largest size
+  and scale the smaller images up.
 - **Converter, Resolution *Auto*.** It reads how much video memory your
-  graphics card has, works out roughly what PawPaint will need, and converts
-  at the project's own size unless the layers could not be imported at that
-  size. Then it uses the largest size that can, says so, and is several times
-  faster for it. Pick a resolution yourself to decide otherwise. The numbers
-  for each texture set are in `report.txt`.
-- **Plugin, Size *Auto (fit graphics card)*.** It opens the project at the
-  converted size. If PawPaint refuses a texture set, it opens the project one
-  size smaller and imports everything again with every layer, from the same
-  converted files (PawPaint scales them; in our test that matched Substance
-  as closely as converting at the smaller size). The panel says when it did.
-- **Size *As converted*, or a fixed size.** The size stays. A texture set that
-  doesn't fit is imported without its baked normal layer, then without its
-  hidden layers, and only as a last resort as the flattened result alone. The
-  panel says which, with PawPaint's numbers.
+  graphics card has and works out roughly what PawPaint will need. If the
+  layers could not all be imported, the texture set that needs the most is
+  converted a size smaller, then the next, until they can. It says which, and
+  is several times faster for it. A resolution you pick yourself is the
+  largest any texture set gets. The numbers are in `report.txt`.
+- **Plugin, Size *Auto (fit graphics card)*.** With PawPaint 1.28 it asks
+  PawPaint whether a material's layers fit before importing them. If they
+  don't, only that material is made a size smaller, and it comes in with every
+  layer from the same converted files (PawPaint scales them; in our test that
+  matched Substance as closely as converting at the smaller size). The panel
+  says when it did. Before 1.28 the whole project is opened a size smaller.
+- **Size *As converted*, or a fixed size.** The sizes stay (a fixed size is
+  the largest any material gets). A material that doesn't fit is imported
+  without its baked normal layer, then without its hidden layers, and only as
+  a last resort as the flattened result alone. The panel says which, with
+  PawPaint's numbers.
 
 Closing other programs that use the graphics card (Substance, games,
 browsers) frees video memory.
@@ -123,7 +130,7 @@ bevel, generators and smart masks.
 - **Compare with Substance's result.** Writes match percentages to report.txt. Off by default because it's slower.
 
 **Command line:** `SppToPawPaint.exe file.spp --cli` plus any of:
-- `--resolution 512|1024|2048|4096` (default: the project's size, or the largest your graphics card can import)
+- `--resolution 512|1024|2048|4096` (the largest size any texture set gets; default: each at its own size, smaller where your graphics card couldn't import it)
 - `--flat-only`, `--layers-only`, `--no-baked`
 - `--mesh-units cm|m|mm|in|raw`
 - `--engine auto|gpu|cpu`, `--detail fast|lossless` (CPU), `--workers N` (0 = all cores), `--check`

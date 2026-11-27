@@ -44,9 +44,10 @@ TIPS
     converter early, the materials that were finished can still be imported.
   - PawPaint keeps every layer on the graphics card. A material with over a hundred
     layers needs about 15 GB of video memory at 4096 and under 4 GB at 2048. Leave
-    Resolution (converter) and Size (plugin) on Auto: they use the largest size your
-    graphics card can import, keep every layer, and tell you when that is smaller than
-    the project. Closing other programs that use the graphics card (Substance, games,
+    Resolution (converter) and Size (plugin) on Auto: every material keeps its own
+    size, one that doesn't fit your graphics card is made a size smaller with every
+    layer kept, and you are told when that happened. (PawPaint 1.28 or newer sizes
+    each material on its own; older versions do it for the whole project.) Closing other programs that use the graphics card (Substance, games,
     browsers) frees video memory.
 
 OWN SUBSTANCE? (optional, for exact layers)

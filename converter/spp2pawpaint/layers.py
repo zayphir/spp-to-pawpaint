@@ -748,6 +748,13 @@ class MaterialConverter:
             if maps and "normal" in maps:
                 spec["normalConvention"] = self.normal_convention
             spec["spp"]["fill"] = {k: v for k, v in vals.items() if k not in MAP_ONLY_CHANNELS}
+            # The values behind the solid-colour images above. PawPaint 1.28 can
+            # set any channel's value, so the plugin then uses these and leaves
+            # the images out (an image on a fill layer costs 85 MB of video
+            # memory at 4096).
+            solid = {cid: vals[cid]["value"] for cid in MAP_ONLY_CHANNELS if cid in vals and cid in channels}
+            if solid:
+                spec["spp"]["solid"] = solid
             spec["spp"]["mapChannels"] = sorted(channels)
             alpha = self._fill_alpha
             if alpha is not None:
