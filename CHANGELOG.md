@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.6 – 2026-11-27
+Fixes projects saved with the current Substance 3D Painter (12.2, the '2026' version). If materials came into PawPaint blank, or without their 'Substance Result' layer, convert the project again with this version. The plugin is unchanged (0.6.5).
+
+- **Projects saved by Substance 12.2 were read wrongly.** That version numbers a material's channels differently in the file (0, 1, 7, 13, 22 where older files have 1, 2, 128, 8192, 4194304). The converter took the height texture for the base colour and didn't recognise the others.
+  - A material with a height channel failed completely (`operands could not be broadcast together ...` or `cannot reshape array ...` in the window) and came into PawPaint with nothing on it.
+  - A material without one converted, but its 'Substance Result' layer was empty and its layers were not corrected against Substance's picture.
+  - Polygon fills are stored differently too (the camera of each pick, and whether it adds or removes), and so are the keys of path strokes. Unread, every polygon fill was skipped and the correction step had to rebuild those masks on its own.
+  - All of it is read correctly now. Checked by saving two older test projects with Substance 12.2: the old and the new file of the same project convert to exactly the same files. Files from older Substance versions convert exactly as before.
+- **A failing correction step no longer costs you the material.** If fitting the layers to Substance's picture fails for any reason, the layers are imported as rebuilt and the 'Substance Result' layer stays. Before, the whole material was dropped.
+- **Base colour kept in another format than the default sRGB8** (RGB8, 16-bit, or greyscale L8 / L16F) came out too dark or failed. Only sRGB8 holds display values; the others hold linear ones, and they are converted now. Measured in Substance.
+- **Linux: the graphics card is found in more situations.** The converter asked only the desktop for OpenGL. With no desktop (a terminal over SSH) that failed, and on a remote or virtual desktop without a graphics driver of its own it got software OpenGL (llvmpipe); either way the conversion ran on the processor. It now also asks the graphics devices directly (EGL) and uses the first real card it finds. Tested on an NVIDIA card: with a desktop, with none, and on a virtual desktop that only offered llvmpipe, the converted files are identical. When it had to look further than the desktop, the window and `log.txt` say what each way gave (`OpenGL asked for: ...`).
+- `log.txt` now also says how the project numbers its channels and what result textures each material has, which makes reports like the one behind this fix quicker to solve.
+
 ## 0.6.5 – 2026-11-26
 Fixes the height bumps along painted lines, and the individual layers are truer to Substance, most of all in projects with soft, hand-painted layers. Convert your project again to get it, and let the converter update the plugin (now 0.6.5 too).
 

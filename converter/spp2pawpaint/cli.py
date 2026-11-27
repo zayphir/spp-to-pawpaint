@@ -204,6 +204,11 @@ def _convert(spp_path, out_dir, resolution, layers, flat, baked, check, mesh_uni
             log("  engine: CPU (%s)" % ("no usable GPU: " + name if engine == "gpu" else "no usable GPU"))
             if engine == "gpu":
                 warnings.append("The GPU engine was requested but no usable GPU was found (%s); the CPU was used." % name)
+        if gpu.tried_text():
+            log("  OpenGL asked for: %s" % gpu.tried_text())
+    if hasattr(log, "detail") and getattr(proj, "doc_version", None) is not None:
+        log.detail("  document version 0x%x, channels named by %s" % (
+            proj.doc_version, "bit number (Substance 12.2 or newer)" if proj.channel_ids_are_indices else "bit flag"))
     lossless = detail == "lossless"
     if use == "cpu" and layers:
         log("  engine: CPU, %s" % ("full detail (lossless, slower)" if lossless else "fast detail"))

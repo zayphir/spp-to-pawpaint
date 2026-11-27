@@ -126,6 +126,43 @@ def _has_class(obj, names):
     return False
 
 
+def unit(a):
+    """A cached texture's values as float32 in Substance's own 0..1 terms."""
+    if a.dtype == np.uint8:
+        return a.astype(np.float32) / 255.0
+    if a.dtype == np.uint16:
+        return a.astype(np.float32) / 65535.0
+    return a.astype(np.float32)
+
+
+def display_colour(rgb, gl_format=None):
+    """A cached colour texture as sRGB bytes, which is what PawPaint wants.
+
+    Only GL_SRGB8_ALPHA8 (Substance's 'sRGB8', the default for colours) holds
+    display values. Every other format holds LINEAR values (measured in
+    Substance 12.2 with one fill of sRGB colour 128, 64, 191: 'RGB8' stores
+    55, 13, 133 and still exports 128, 64, 191; 'L8' and 'L16F' store 0.2625,
+    the mean of the three linear values). Without a known format, bytes are
+    taken as display values, as before."""
+    if rgb.dtype == np.uint8 and gl_format in (None, S.GL_SRGB8_ALPHA8):
+        return rgb
+    return (linear_to_srgb(unit(rgb)) * 255 + 0.5).astype(np.uint8)
+
+
+def colour_and_alpha(img):
+    """A colour texture from Substance's cache (H x W x channels) as
+    (H x W x 3, alpha H x W or None). A colour channel normally has four
+    values per texel. One that Substance keeps as greyscale has two (value,
+    alpha) or one; taking 'the first three' of those left a two-channel
+    picture, and the layer correction failed on it for the whole texture set
+    ('operands could not be broadcast together with shapes (3,43008)
+    (3,28672)': three values per texel against two)."""
+    c = img.shape[2]
+    if c >= 3:
+        return img[..., :3], (img[..., 3] if c >= 4 else None)
+    return np.repeat(img[..., :1], 3, -1), (img[..., 1] if c == 2 else None)
+
+
 def linear_to_srgb(c):
     c = np.clip(np.asarray(c, np.float64), 0, 1)
     return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
@@ -384,11 +421,17 @@ class MaterialConverter:
         maps = {}
         replace = {}
         has_rough = S.CH_ROUGHNESS in cache
+        detail = getattr(self.log, "detail", None)
+        if detail:      # the log file says what Substance stored, for reports
+            detail("    result textures%s: %s" % (
+                " (rebuilt, no cache)" if approximate else "",
+                ", ".join("%s %s x%d %dx%d" % (S.CHANNEL_NAMES.get(f, f), a.dtype, a.shape[2], a.shape[1], a.shape[0])
+                          for f, a in sorted(cache.items()))))
+        formats = {} if approximate or not hasattr(self.p, "cached_formats") else self.p.cached_formats(self.doc)
         for flag, img in cache.items():
             if flag == S.CH_GLOSSINESS and not has_rough:
                 # spec/gloss project: PawPaint is metal/rough, so give it roughness
-                g = self._resize(img)[..., 0]
-                g = _f(g) if g.dtype == np.uint8 else g.astype(np.float32)
+                g = unit(self._resize(img)[..., 0])
                 maps["roughness"] = self._write_gray(1.0 - g, "result_roughness")
                 self._warn("glossiness converted to roughness (1 - glossiness)")
             if flag not in CHANNEL_MAP:
@@ -398,15 +441,18 @@ class MaterialConverter:
             img = self._resize(img)
             tag = "result_%s" % cid
             if flag in (S.CH_BASECOLOR, S.CH_EMISSIVE, S.CH_SPECULAR):
-                rgb = img[..., :3]
-                if rgb.dtype != np.uint8:
-                    rgb = (linear_to_srgb(rgb.astype(np.float32)) * 255 + 0.5).astype(np.uint8) \
-                        if not approximate else _u8(rgb)
+                rgb, alpha = colour_and_alpha(img)
+                if img.shape[2] < 3:
+                    self._warn("the %s channel is stored as greyscale in this texture set" % S.CHANNEL_NAMES.get(flag, cid))
+                if approximate:
+                    rgb = rgb if rgb.dtype == np.uint8 else _u8(rgb)
+                else:
+                    rgb = display_colour(rgb, formats.get(flag))
                 maps[cid] = self._write_rgb(rgb, tag)
                 if flag == S.CH_BASECOLOR and not approximate:
                     self.cache_albedo = rgb
-                    if img.shape[2] >= 4:
-                        self.cache_albedo_alpha = _f(img[..., 3]) if img.dtype == np.uint8 else img[..., 3].astype(np.float32)
+                    if alpha is not None:
+                        self.cache_albedo_alpha = unit(alpha)
             elif flag == S.CH_NORMAL:
                 nrm = _f(img[..., :3]) if img.dtype == np.uint8 else img[..., :3].astype(np.float32)
                 # texels Substance never computed are stored as 0,0,0: they're flat
@@ -431,8 +477,7 @@ class MaterialConverter:
                 maps[cid] = self._write_gray(never_flat(h), tag, bits=16)
                 replace[cid] = {"blendMode": "Replace", "opacity": 1.0}
             else:
-                v = img[..., 0]
-                v = _f(v) if v.dtype == np.uint8 else v.astype(np.float32)
+                v = unit(img[..., 0])
                 self.result_arrays[cid] = v
                 maps[cid] = self._write_gray(v, tag)
             if custom:
@@ -1093,7 +1138,24 @@ class MaterialConverter:
     def _fit_masks(self):
         from . import refine
         self.log("    fitting masks to Substance's result...")
-        new, baked, resid, st = refine.fit(self, self.cache_albedo, self.coverage(), self.log)
+        try:
+            new, baked, resid, st = refine.fit(self, self.cache_albedo, self.coverage(), self.log)
+        except MemoryError:
+            raise
+        except Exception as e:
+            # The correction is an improvement on top of a texture set that is
+            # already converted. If it fails, the set must not be lost with it
+            # (it used to be: no layers and no result layer at all).
+            import traceback
+            self.log("    the masks could not be fitted (%s); the layers stay as rebuilt from the project" % e)
+            detail = getattr(self.log, "detail", None)
+            if detail:
+                detail(traceback.format_exc())
+            self._context = ""
+            self._warn("the layers could not be corrected against Substance's result (%s). They are imported "
+                       "as rebuilt from the project; the 'Substance Result' layer still shows Substance's "
+                       "picture. Please report this with log.txt" % e)
+            return
         n = max(st["texels"], 1)
         self.fit_stats = st
         self.log("    masks fitted: layers match Substance on %.2f%% of texels (was %.2f%%), %.2f%% need the "

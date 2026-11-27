@@ -19,6 +19,7 @@ context can be created, the converter falls back to the CPU path.
 """
 
 import math
+import sys
 
 import numpy as np
 
@@ -32,14 +33,66 @@ import threading
 _TLS = threading.local()   # an OpenGL context belongs to the thread that made it
 
 
+EGL_DEVICE_TRIES = 8
+
+
+def routes(platform=None):
+    """The ways to ask for an OpenGL context, in the order they are tried:
+    [(label, keyword arguments for moderngl)].
+
+    Everywhere: the system's default. On Linux that goes through the desktop's
+    X server, which fails with no desktop (a terminal over SSH) and gives
+    software OpenGL when that X server has no graphics driver of its own (a
+    remote or virtual desktop). So on Linux the graphics devices are also
+    asked directly through EGL, which needs no desktop at all (measured on an
+    NVIDIA card: with no display the default fails and EGL device 0 is the
+    card; Mesa's software renderer is a further EGL device)."""
+    out = [("default", {})]
+    if (platform or sys.platform).startswith("linux"):
+        out += [("EGL device %d" % i, {"backend": "egl", "device_index": i}) for i in range(EGL_DEVICE_TRIES)]
+    return out
+
+
+def pick_context(create, ways):
+    """The first context among `ways` that a graphics card draws; if there is
+    none, the first software one; else None.
+    -> (context or None, [(label, renderer name or None, error or None)])"""
+    tried, soft = [], None
+    for label, kw in ways:
+        try:
+            ctx = create(**kw)
+        except Exception as e:  # no GPU / driver / display
+            msg = str(e)
+            tried.append((label, None, msg))
+            if "device index" in msg and "found" in msg:
+                break                                # past the last EGL device
+            continue
+        name = ctx.info.get("GL_RENDERER", "GPU")
+        tried.append((label, name, None))
+        if not is_software(name):
+            return ctx, tried
+        ctx.release()                                # keep looking for a real card
+        if soft is None:
+            soft = kw
+    if soft is not None:
+        try:
+            return create(**soft), tried
+        except Exception:
+            pass
+    return None, tried
+
+
 def context():
     if not getattr(_TLS, "tried", False):
         _TLS.tried = True
-        _TLS.ctx, _TLS.error = None, None
+        _TLS.ctx, _TLS.error, _TLS.routes = None, None, []
         try:
             import moderngl
-            _TLS.ctx = moderngl.create_standalone_context(require=430)
-        except Exception as e:  # no GPU / driver / headless
+            _TLS.ctx, _TLS.routes = pick_context(
+                lambda **kw: moderngl.create_standalone_context(require=430, **kw), routes())
+            if _TLS.ctx is None:
+                _TLS.error = next((err for _, _, err in _TLS.routes if err), None)
+        except Exception as e:  # moderngl itself is missing or broken
             _TLS.error = str(e)
     return _TLS.ctx
 
@@ -50,6 +103,17 @@ def available():
     if ctx is None:
         return False, getattr(_TLS, "error", None) or "no OpenGL 4.3 context"
     return True, ctx.info.get("GL_RENDERER", "GPU")
+
+
+def tried_text():
+    """What each way of asking for OpenGL gave, for the log; '' when only the
+    default was asked (every system but Linux, and Linux when it just works)."""
+    context()
+    ways = getattr(_TLS, "routes", [])
+    if len(ways) < 2:
+        return ""
+    return "; ".join("%s: %s" % (label, name or "failed (%s)" % " ".join(str(err).split())[:70])
+                     for label, name, err in ways)
 
 
 def _gl_get_integer():

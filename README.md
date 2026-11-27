@@ -164,15 +164,26 @@ python -m spp2pawpaint /path/to/project.spp
   folder that way for the plugin, e.g. `Z:\home\you\My project (PawPaint import)`.
   Use that form if you paste a folder into the plugin by hand. A Flatpak Steam
   can only open folders it has been given access to.
-- Engine *Auto* uses the graphics card through OpenGL 4.3. Where only software
-  OpenGL exists (llvmpipe), it uses the CPU engine, which is faster.
+- Engine *Auto* uses the graphics card through OpenGL 4.3. It asks the desktop
+  first and then the graphics devices directly (EGL), so the card is also
+  found with no desktop at all (a terminal over SSH) and on a remote or
+  virtual desktop that only offers software OpenGL (llvmpipe). Where nothing
+  but software OpenGL exists, it uses the CPU engine, which is faster.
+- If a conversion runs on the processor although the computer has a graphics
+  card, look for the line `OpenGL asked for: ...` in the window or in
+  `log.txt`: it says what each way of asking gave. Usual causes are a missing
+  graphics driver, a Python from a sandbox or another distribution (Flatpak,
+  Snap, conda) that can't load the system's driver, and a virtual machine or
+  container without access to the card.
 
 **How far this is tested:** on Ubuntu 24.04 with Ubuntu's own Steam package
 and an NVIDIA RTX 4090 (driver 595): the converter found PawPaint, installed
 the plugin and handed the conversion over; PawPaint's native version imported
 every texture set with all its layers; and what PawPaint showed matched
 Substance as closely as on Windows. The converter gives the same results as
-on Windows on both engines (CPU, and OpenGL on the NVIDIA driver). Not tested:
+on Windows on both engines (CPU, and OpenGL on the NVIDIA driver), and the
+same files whether it reaches that card through the desktop, with no desktop,
+or from a virtual desktop without a graphics driver. Not tested:
 AMD and Intel graphics, Flatpak and Snap Steam, and Proton. If you try one of
 those, please open an issue and say how it went.
 
@@ -180,7 +191,7 @@ those, please open an issue and say how it went.
 
 | Substance | PawPaint | Notes |
 |---|---|---|
-| Texture sets | Materials | Matched by name, or by hand. Projects from older Substance versions and from 9.1 both work |
+| Texture sets | Materials | Matched by name, or by hand. Projects saved by Substance 9.1 up to the current 12.2 ('2026') are read, older ones too |
 | Folders, nesting, visibility, opacity, blend modes | Same | Unsupported blend modes fall back to Normal, with a note |
 | Fill layers with colour / value channels | Fill layers with the same values | Base colour and emission converted from linear to sRGB |
 | Image fills (bitmaps) | Fill layers with that image | UV tiling, offset and rotation applied; transparency is respected. In masks, planar and (undeformed) warp projections are rebuilt; other projections are applied in UV space, with a note |

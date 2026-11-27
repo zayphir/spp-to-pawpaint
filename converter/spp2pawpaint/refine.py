@@ -458,6 +458,13 @@ def fit(mc, cache_rgb, coverage, log=print):
     """Fit the masks (see _fit). The worker processes of a big fit are stopped
     again afterwards: idle, they would hold memory the next texture set's mask
     painting needs."""
+    cache_rgb = np.asarray(cache_rgb)
+    if cache_rgb.ndim == 2:
+        cache_rgb = cache_rgb[..., None]
+    if cache_rgb.shape[2] < 3:               # greyscale (with or without alpha): the fit works on colours
+        cache_rgb = np.repeat(cache_rgb[..., :1], 3, -1)
+    elif cache_rgb.shape[2] > 3:
+        cache_rgb = cache_rgb[..., :3]
     try:
         return _fit(mc, cache_rgb, coverage, log)
     finally:
