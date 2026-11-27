@@ -135,7 +135,10 @@ Run it with `--help` for the full list.
 
 ### Linux
 
-There is no Linux download yet. Run the converter with Python 3.10 or newer:
+PawPaint has a native Linux version on Steam, and the plugin works in it the
+same way as on Windows. There is no Linux download of the converter yet. Run
+it with Python 3.10 or newer (on Ubuntu and Debian you may need
+`sudo apt install python3-venv` first):
 
 ```sh
 git clone https://github.com/zayphir/spp-to-pawpaint
@@ -150,21 +153,28 @@ python -m spp2pawpaint /path/to/project.spp
   in the terminal.
 - PawPaint is looked for in Steam's usual folders, including Flatpak and Snap
   installs and extra Steam libraries. If it isn't found, pass
-  `--pawpaint-dir FOLDER` or set `PAWPAINT_DIR`.
-- When PawPaint runs through Proton it sees your files through drive letters
-  (`Z:` is `/`). The converter writes the folder that way for the plugin and
-  prints it, e.g. `Z:\home\you\My project (PawPaint import)`. Use that form if
-  you paste a folder into the plugin by hand. A Flatpak Steam can only open
-  folders it has been given access to.
+  `--pawpaint-dir FOLDER` or set `PAWPAINT_DIR`. Like on Windows, the
+  converter installs the plugin and PawPaint offers the latest conversion in
+  Plugins > Substance Importer (restart PawPaint once after the first install).
+- PawPaint's own log on Linux is `~/.local/state/PawPaint/logs/pawpaint.log`
+  (on Windows it is in PawPaint's folder). Look there for `[spp]` lines if a
+  texture set doesn't come in.
+- If you force PawPaint to run through Proton instead, it sees your files
+  through drive letters (`Z:` is `/`). The converter notices and writes the
+  folder that way for the plugin, e.g. `Z:\home\you\My project (PawPaint import)`.
+  Use that form if you paste a folder into the plugin by hand. A Flatpak Steam
+  can only open folders it has been given access to.
 - Engine *Auto* uses the graphics card through OpenGL 4.3. Where only software
   OpenGL exists (llvmpipe), it uses the CPU engine, which is faster.
 
-**How far this is tested:** the converter gives the same results on Ubuntu
-24.04 as on Windows (CPU engine, and the OpenGL engine on software OpenGL),
-and installing the plugin and the handoff were tried against a made-up Steam
-library. **Not tested yet:** PawPaint itself on Linux picking up a conversion,
-and the OpenGL engine on a real Linux graphics driver. If you try it, please
-open an issue and say how it went.
+**How far this is tested:** on Ubuntu 24.04 with Ubuntu's own Steam package
+and an NVIDIA RTX 4090 (driver 595): the converter found PawPaint, installed
+the plugin and handed the conversion over; PawPaint's native version imported
+every texture set with all its layers; and what PawPaint showed matched
+Substance as closely as on Windows. The converter gives the same results as
+on Windows on both engines (CPU, and OpenGL on the NVIDIA driver). Not tested:
+AMD and Intel graphics, Flatpak and Snap Steam, and Proton. If you try one of
+those, please open an issue and say how it went.
 
 ## What converts
 
