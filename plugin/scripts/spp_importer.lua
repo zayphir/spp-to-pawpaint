@@ -13,7 +13,7 @@
 --
 -- Unofficial community tool, not made or supported by PawWorks or Adobe.
 
-local IMPORTER_VERSION = "0.6.3"
+local IMPORTER_VERSION = "0.6.5"
 local PENDING_FILE = "scripts/spp_importer_pending.json"
 
 local MESH_SPP, MESH_OWN, MESH_OPEN = 1, 2, 3
@@ -38,6 +38,7 @@ local state = {
     flatMode = 1,          -- 1 on top + visible, 2 on top + hidden, 3 leave out
     layers = true,
     baked = true,
+    height = true,         -- false: nothing that is imported changes the height (bumps)
     force = false,
     status = "Convert a .spp with SppToPawPaint, then click Import.",
     busy = false,
@@ -133,6 +134,8 @@ end
 -- 1 to 3 are the fallbacks when PawPaint refuses a texture set for lack of
 -- video memory and the project can't be made smaller instead.
 local LAST_LEVEL = 3
+local HEIGHT_CHANNELS = { height = true, displacement = true }
+
 local function wantLayer(l, level, hidden)
     level = level or 0
     local spp = nonNull(l.spp) or {}
@@ -179,17 +182,21 @@ local function buildSpec(dir, manifest, level)
                 s.channelOverrides = {}
                 for id, e in pairs(ov) do
                     e = nonNull(e)
-                    if type(e) == "table" then
+                    if type(e) == "table" and (state.height or not HEIGHT_CHANNELS[id]) then
                         s.channelOverrides[id] = { blendMode = nonNull(e.blendMode), opacity = nonNull(e.opacity) }
                     end
                 end
+                if next(s.channelOverrides) == nil then s.channelOverrides = nil end
             end
             local ch = nonNull(l.channels)
             if type(ch) == "table" then
                 s.channels = {}
                 for id, p in pairs(ch) do
                     p = nonNull(p)
-                    if type(p) == "string" then s.channels[id] = join(dir, p) end
+                    -- 'Height' unticked: no layer brings a height image
+                    if type(p) == "string" and (state.height or not HEIGHT_CHANNELS[id]) then
+                        s.channels[id] = join(dir, p)
+                    end
                 end
                 if next(s.channels) == nil then s.channels = nil end
             end
@@ -256,6 +263,7 @@ local function applyFill(i, fill, mapChannels)
     local n = v("normal")
     if type(n) == "table" then pp.fill.setNormal(i, n[1], n[2], n[3]) end
     local h = v("height")
+    if not state.height then h = nil end
     if type(h) == "number" then pp.fill.setHeight(i, h) end
     -- A fill layer multiplies its channel images by the fill value (colour
     -- images by the colour, grey ones through a level where 0.5 is neutral,
@@ -270,6 +278,8 @@ local function applyFill(i, fill, mapChannels)
             pp.fill.setChannelEnabled(i, id, fill[id] ~= nil and nonNull(fill[id]) ~= nil)
         end
     end
+    -- 'Height' unticked: fill layers leave the height alone too
+    if not state.height then pp.fill.setChannelEnabled(i, "height", false) end
 end
 
 local function finishMaterial(matIndex, before, meta, removeDefaults)
@@ -282,7 +292,7 @@ local function finishMaterial(matIndex, before, meta, removeDefaults)
         local info = tag and meta[tag]
         if info then
             local isFill = pp.layers.type(i) == "Fill"
-            if isFill and (info.fill or info.maps) then
+            if isFill and (info.fill or info.maps or not state.height) then
                 applyFill(i, info.fill, info.maps)
             end
             if isFill and type(info.only) == "table" then
@@ -684,6 +694,8 @@ buildPanel = function()
                   onChange = function(on) state.layers = on end }
     w[#w + 1] = { type = "checkbox", label = "Baked normal map", value = state.baked,
                   onChange = function(on) state.baked = on end }
+    w[#w + 1] = { type = "checkbox", label = "Height (bumps)", value = state.height,
+                  onChange = function(on) state.height = on end }
     if state.meshSource ~= MESH_OPEN then
         w[#w + 1] = { type = "checkbox", label = "Discard unsaved changes", value = state.force,
                       onChange = function(on) state.force = on end }
@@ -721,15 +733,17 @@ end)
 log("Substance Importer " .. IMPORTER_VERSION .. " loaded - see Plugins > Substance Importer")
 
 -- Scripting entry point (batch imports, automated tests):
---   SppImporter.import("C:/path/Model (PawPaint import)", discardUnsaved [, size])
+--   SppImporter.import("C:/path/Model (PawPaint import)", discardUnsaved [, size [, height]])
 -- Same as filling in the panel and clicking Import. Only discards unsaved
 -- changes when `discardUnsaved` is true. size: "auto", "converted", 2048,
 -- 1024 or 512 (the panel's Size option; left as it is when not given).
+-- height: false imports without any height, true with (the Height option).
 SppImporter = {
     version = IMPORTER_VERSION,
-    import = function(folder, discardUnsaved, size)
+    import = function(folder, discardUnsaved, size, height)
         state.folder = folder
         state.force = discardUnsaved and true or false
+        if height ~= nil then state.height = height and true or false end
         if size == "auto" then state.size = SIZE_AUTO
         elseif size == "converted" then state.size = SIZE_CONVERTED
         elseif size ~= nil then

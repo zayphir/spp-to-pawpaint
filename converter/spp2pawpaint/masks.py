@@ -32,6 +32,26 @@ BLEND_REPLACE = 1
 MASK_GROUP_BLACK = True
 UV_SAME_ISLAND = True            # UV-view stamps only reach the UV island under the cursor
 UV_MIRROR = True                 # apply stroke symmetry to UV-view strokes (via the 3D surface)
+# Back-face culling of brush stamps. A brush with Substance's default
+# alignment (DataBrush.alignment 3, 'Tangent | Wrap' in the brush settings)
+# wraps onto every surface inside its stamp, whichever way that surface
+# faces; skipping surfaces that face away from the stroke's camera (or, in
+# the UV view, from the surface under the cursor) left stripes on round parts
+# painted from several sides and missed the far side of thin ones. Checked
+# against Substance's own per-layer pictures of four projects: with wrap
+# brushes painting everything in the stamp no texture set got worse and the
+# hand-painted gradient layers of one project went from 65 to 43 wrong
+# layer-texels per 100. Other alignments keep the culling: for alignment 2
+# (seen on UV-view strokes) the pictures disagree between projects.
+ALIGN_WRAP = 3
+WRAP_BRUSH_CULLS = False
+
+
+def brush_culls(brush):
+    """True when this brush's stamps skip surfaces that face away."""
+    if not brush.get("cullingEnabled", True):
+        return False
+    return WRAP_BRUSH_CULLS or int(brush.get("alignment", ALIGN_WRAP)) != ALIGN_WRAP
 # Polygon-fill picks and brush strokes only see the meshes of the layer's own
 # texture set: other texture sets never block them. Measured against
 # Substance's per-layer export of a test project: the fur cards (texture set 'fluff') sit
@@ -647,7 +667,7 @@ class MaskBuilder:
         if strokes2d:
             # Screen-space strokes: brush size is relative to the viewport.
             c2 = self._painter().cover(strokes2d, brush, hardness, self.allowed,
-                                    cull=brush.get("cullingEnabled", True), flow=flow, spacing=spacing,
+                                    cull=brush_culls(brush), flow=flow, spacing=spacing,
                                     space=space, density=self._uv_density())
             if c2 is not None:
                 if cover is None:
@@ -755,7 +775,7 @@ class MaskBuilder:
                 m = self.geo.uv_island == i_
                 allowed = m if allowed is None else (allowed & m)
             cov = self._painter().cover_segments(segs, hardness, flow, spacing, allowed,
-                                                 cull=brush.get("cullingEnabled", True))
+                                                 cull=brush_culls(brush))
             if cov is None:
                 continue
             cov = as_full(cov)

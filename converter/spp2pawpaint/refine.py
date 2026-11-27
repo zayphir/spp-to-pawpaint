@@ -78,6 +78,18 @@ TRUST_MAX_BAD = 0.10
 EDIT_WEIGHT = (12.0 / 255.0) ** 2
 UNDER_WEIGHT = 1.25        # evidence for the layer right under a see-through layer (see solve)
 MULTIPLY_PRIOR = (4.0 / 255.0) ** 2    # pull towards the replayed shading strength
+# Joint edit: explain a mismatched texel by nudging the coverage of several
+# layers at once, each as little as possible, instead of rewriting the texel
+# as 'one layer' or 'one layer over another'. Where soft layers overlap (three
+# airbrushed colours over each other) the replay is usually nearly right, and a
+# rewrite as a pair throws away the third layer and sets the lower one to full.
+JOINT_EDIT = True
+JOINT_RIDGE = 1e-3         # keeps the joint step small where the layers' colours are nearly alike
+JOINT_STEPS = 1            # steps of the joint edit (the layers' directions are kept from the first)
+# What a single-layer or pair explanation pays per unit of coverage it changes
+# against the replay, as a share of EDIT_WEIGHT (the edits pay 1). 0 = nothing,
+# as before the joint edit existed.
+REWRITE_WEIGHT = 1.0
 
 
 def _f(a):
@@ -841,6 +853,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     CbT = _turned(Cb)
     specs_T = [_turned(t) for _, t in specs_all]
     best_cost = np.full(m, np.inf, np.float32)
+    best_err = np.full(m, np.inf, np.float32)      # largest channel error of the best single layer
     best = np.full(m, -1, np.int64)
     best_k = [np.array(k, np.float32) for k in k0_all]
     cand_cost = []
@@ -868,6 +881,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
         cand_cost.append(cost)
         better = cost < best_cost
         best_cost = np.where(better, cost, best_cost)
+        best_err = np.where(better, np.abs(Cb - F).max(1), best_err)
         best = np.where(better, j, best)
         for q in range(len(ks)):
             best_k[q] = np.where(better, ks[q], best_k[q])
@@ -893,6 +907,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     kk = min(PAIR_CANDIDATES, nn)
     top = np.argsort(cc, 0)[:kk]                                 # ranks into `normal`
     pair_cost = np.full(m, np.inf, np.float32)
+    pair_err = np.full(m, np.inf, np.float32)
     upper = np.full(m, -1, np.int64)
     lower = np.full(m, -1, np.int64)
     alpha = np.zeros(m, np.float32)
@@ -933,6 +948,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
                 cost = err + ev_cost
                 ok = (up != lo) & (reach_all[u_r, ar] > 0.5) & (cost < pair_cost)
                 pair_cost = np.where(ok, cost, pair_cost)
+                pair_err = np.where(ok, np.abs(d).max(1), pair_err)
                 upper = np.where(ok, up, upper)
                 lower = np.where(ok, lo, lower)
                 alpha = np.where(ok, al, alpha)
@@ -940,6 +956,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     use_pair = (pair_cost + 1e-7 < best_cost) & (upper >= 0)
     # one-layer edits (see ONE_EDIT)
     edit_cost = np.full(m, np.inf, np.float32)
+    edit_err = np.full(m, np.inf, np.float32)
     edit_j = np.full(m, -1, np.int64)
     edit_k = np.zeros(m, np.float32)
     if ONE_EDIT:
@@ -951,6 +968,7 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
         for j in sorted(normal):
             under[j] = below.copy()
             below = below + (1 - below) * np.clip(Ks[j], 0, 1)
+        parts = []                             # for the joint edit: (layer, texels, effect per unit coverage, top, evidence)
         for j in list(normal) + list(blends):
             kmax = leaves[j].max_k(y0, y1, n)[idx]
             ev = evidence[j][y0:y1].reshape(-1)[idx] / 255.0
@@ -977,19 +995,61 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
             K1[j] = kmax[sub]
             F1 = forward_turned(leaves, csub, K1, len(sub))
             dv = F1 - F0
+            if JOINT_EDIT:
+                parts.append((j, sub, (dv / kmax[sub]).astype(np.float32), kmax[sub],
+                              ev[sub] if leaves[j].mode != "Normal" else None))
             t = np.clip(((Cs - F0) * dv).sum(0) / np.maximum((dv * dv).sum(0), 1e-8), 0, 1)
             knew = t * kmax[sub]
             K1[j] = knew
             dd = Cs - forward_turned(leaves, csub, K1, len(sub))
-            cost = (dd ** 2).sum(0) + EDIT_WEIGHT * np.abs(knew - Ks[j][sub])
+            e2 = (dd ** 2).sum(0)
+            cost = e2 + EDIT_WEIGHT * np.abs(knew - Ks[j][sub])
             if leaves[j].mode != "Normal":      # blend strength beyond what the replay has
                 cost = cost + 4 * EVIDENCE_WEIGHT * np.maximum(knew - ev[sub], 0)
             better = cost < edit_cost[sub]
             w = sub[better]
             edit_cost[w] = cost[better]
+            edit_err[w] = np.abs(dd).max(0)[better]
             edit_j[w] = j
             edit_k[w] = knew[better]
-    use_edit = (edit_j >= 0) & (edit_cost <= np.minimum(best_cost, np.where(upper >= 0, pair_cost, np.inf)))
+    # joint edit (see JOINT_EDIT): the smallest change of all live layers together
+    # that explains the texel, from one Gauss-Newton step. The picture is linear
+    # in each layer's coverage, so `d` (the effect of a layer per unit coverage)
+    # is exact for that layer alone; the step is checked with the real picture.
+    joint_cost = np.full(m, np.inf, np.float32)
+    joint_max = np.full(m, np.inf, np.float32)     # largest channel error after the joint edit
+    Kj = None
+    if ONE_EDIT and JOINT_EDIT and parts:
+        A = np.zeros((m, 3, 3), np.float32)
+        for j, sub, d, _, _ in parts:
+            A[sub] += d.T[:, :, None] * d.T[:, None, :]
+        A += np.float32(JOINT_RIDGE) * np.eye(3, dtype=np.float32)
+        Kj = Ks.copy()
+        Kc = Ks.copy()                         # the iterate; Kj keeps each texel's best so far
+        dj = CbT - forward_turned(leaves, cs, Kc, m)                    # (3, m)
+        joint_err = np.full(m, np.inf, np.float32)
+        for _ in range(JOINT_STEPS):
+            y = np.linalg.solve(A, dj.T[:, :, None])[:, :, 0]          # (m, 3)
+            for j, sub, d, top_k, _ in parts:
+                Kc[j][sub] = np.clip(Kc[j][sub] + (d * y[sub].T).sum(0), 0, top_k)
+            dj = CbT - forward_turned(leaves, cs, Kc, m)
+            e2 = (dj ** 2).sum(0).astype(np.float32)
+            better = e2 < joint_err
+            if not better.any():
+                break
+            joint_err = np.where(better, e2, joint_err)
+            joint_max = np.where(better, np.abs(dj).max(0), joint_max)
+            Kj[:, better] = Kc[:, better]
+            if (joint_max <= np.float32(TOL) * 0.5).all():
+                break
+        change = np.zeros(m, np.float32)
+        extra = np.zeros(m, np.float32)
+        for j, sub, d, top_k, evb in parts:
+            change[sub] += np.abs(Kj[j][sub] - Ks[j][sub])
+            if evb is not None:                 # blend strength beyond what the replay has
+                extra[sub] += 4 * EVIDENCE_WEIGHT * np.maximum(Kj[j][sub] - evb, 0)
+        joint_cost = (joint_err + EDIT_WEIGHT * change + extra).astype(np.float32)
+        joint_cost = np.where(change > 0, joint_cost, np.inf)
     # write the solution
     top = np.where(use_pair, upper, best)
     low = np.where(use_pair, lower, best)
@@ -1005,6 +1065,30 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
         new_k[sel_top] = np.where(use_pair[sel_top], alpha[sel_top], 1.0)
         prop[j] = np.minimum(new_k, leaves[j].max_k(y0, y1, n)[idx])
     blend_new = [np.where(use_pair & pair_replayed, k0_all[q], best_k[q]) for q in range(len(blends))]
+    # a single / pair explanation rewrites the texel; the edits only nudge it
+    rewrite_cost = np.minimum(best_cost, np.where(upper >= 0, pair_cost, np.inf))
+    if REWRITE_WEIGHT > 0:
+        moved = np.zeros(m, np.float32)
+        for j in normal:
+            moved += np.abs(prop[j] - K[j][idx])
+        for q in range(len(blends)):
+            moved += np.abs(blend_new[q] - k0_all[q])
+        rewrite_cost = rewrite_cost + np.float32(REWRITE_WEIGHT * EDIT_WEIGHT) * moved
+    if JOINT_EDIT:
+        # An explanation that reproduces the texel beats one that doesn't,
+        # whatever it costs; among those that do, the cheapest wins. So paying
+        # for rewrites never trades the picture for tidier layers.
+        tol = np.float32(TOL)
+        rewrite_err = np.where(use_pair, pair_err, best_err)
+        costs = [rewrite_cost, np.where(edit_j >= 0, edit_cost, np.inf), joint_cost]
+        fine = [(rewrite_err <= tol), (edit_err <= tol) & (edit_j >= 0), (joint_max <= tol) & np.isfinite(joint_cost)]
+        any_fine = fine[0] | fine[1] | fine[2]
+        costs = [np.where(any_fine & ~f, np.inf, c) for c, f in zip(costs, fine)]
+        use_edit = (edit_j >= 0) & (costs[1] <= costs[0]) & np.isfinite(costs[1])
+        use_joint = (costs[2] < np.minimum(costs[0], costs[1]))
+    else:
+        use_edit = (edit_j >= 0) & (edit_cost <= rewrite_cost)
+        use_joint = np.zeros(m, bool)
     # a single/pair explanation that would rewrite a trusted layer is dropped:
     # use the one-layer edit if there is one, else keep the replay as it is
     veto = np.zeros(m, bool)
@@ -1014,8 +1098,8 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     for q, mi in enumerate(blends):
         if mi in trusted:
             veto |= np.abs(blend_new[q] - k0_all[q]) > 0.02
-    keep = use_edit | veto
-    use_edit = (use_edit | veto) & (edit_j >= 0)
+    keep = use_edit | veto | use_joint
+    use_edit = (use_edit | veto) & (edit_j >= 0) & ~use_joint
     for q, mi in enumerate(blends):
         K[mi][idx] = np.where(keep, k0_all[q], blend_new[q])
     for j in normal:
@@ -1023,6 +1107,10 @@ def solve(leaves, cols, K, C, bad, normal, blends, evidence, y0, y1, n, trusted=
     for j in np.unique(edit_j[use_edit]):
         sel = use_edit & (edit_j == j)
         K[j][idx[sel]] = edit_k[sel]
+    if use_joint.any():
+        for j, sub, _, _, _ in parts:
+            sel = sub[use_joint[sub]]
+            K[j][idx[sel]] = Kj[j][sel]
     return K
 
 

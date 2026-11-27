@@ -35,6 +35,8 @@ TIPS
   - Want shape keys? In the plugin choose Mesh: "My own model file" and give your FBX.
     Or open your FBX in PawPaint first and choose "The project open now".
   - Texture sets that don't match a material by name can be matched by hand in the panel.
+  - Don't want the height (bumps) from Substance? Untick "Height (bumps)" in the plugin
+    before you click Import.
   - Windows may warn about an unknown app the first time (it isn't code-signed):
     More info > Run anyway.
   - Big projects take a while: a material with over a hundred layers at 4096 can need

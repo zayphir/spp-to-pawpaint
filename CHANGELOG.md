@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.5 – 2026-11-26
+Fixes the height bumps along painted lines, and the individual layers are truer to Substance, most of all in projects with soft, hand-painted layers. Convert your project again to get it, and let the converter update the plugin (now 0.6.5 too).
+
+- **Bumps along painted lines, with the 'Substance Result' layer hidden.** PawPaint reads a painted layer's height from the image as it is and ignores the image's transparency. Painted layers were written with 'nothing' outside the strokes, which PawPaint took as a deep pit, with a cliff along every stroke edge. A project that has no height at all in Substance came out covered in bumps. A painted layer's height is now flat wherever nothing is painted, and a layer whose strokes carry no height gets no height image at all.
+- **Soft edges of painted colour layers were too dark.** The same images stored the colour already multiplied by the stroke's coverage. They now hold the plain colour.
+- **Plugin: new 'Height (bumps)' option.** Untick it to import without any height.
+- **Soft brush strokes now reach around the model.** A brush with Substance's default alignment paints every surface inside its stamp. The converter skipped the surfaces facing away from the camera, which left stripes on round parts (a tail painted from several sides) and missed the far side of thin ones (fur tufts).
+- **Overlapping soft layers keep their own shapes.** Where the rebuilt picture was slightly off, the correction step used to re-explain the spot as 'one layer' or 'one layer over another', which could throw away a third layer or push one to full strength. It now first tries to nudge all the layers there a little, and only rewrites when that can't reproduce Substance's picture. On the project this was tuned on, hiding or recolouring a single layer gives a result much closer to Substance's, and the layers on their own match Substance's picture on more of the texture as well (97.4 % to 98.2 % for its biggest material, measured in PawPaint).
+- Conversions are a little faster.
+
 ## 0.6.4 – 2026-11-26
 Two fixes for layers that came out wrong in PawPaint. Convert your project again to get them. Projects that use neither thing convert exactly as with 0.6.3. The plugin is unchanged (0.6.3).
 

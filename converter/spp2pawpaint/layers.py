@@ -156,6 +156,19 @@ def _f(a):
 HEIGHT_FIX_TOL = 1.0 / 255.0      # the layers' height may be this far from Substance's before the detail fix takes over
 
 
+def _straight(val, al):
+    """Colours that were built up stroke by stroke from nothing (so they hold
+    'colour x coverage') as plain colours for an image with a separate alpha."""
+    a = al[..., None] if val.ndim == 3 else al
+    return np.clip(np.where(a > 1e-6, val / np.maximum(a, 1e-6), 0.0), 0, 1).astype(np.float32)
+
+
+def painted_height(val, alpha):
+    """The height image of a painted layer: `val` where it is painted, flat
+    (0.5) where it isn't, and in between by the coverage `alpha`."""
+    return (0.5 + (np.asarray(val, np.float32) - 0.5) * alpha).astype(np.float32)
+
+
 def never_flat(h):
     """A height image (0..1, 0.5 = flat) for a layer whose height replaces
     what is below it. PawPaint's Replace leaves a texel alone when the layer's
@@ -708,14 +721,31 @@ class MaterialConverter:
             if _has_content(actions):     # an empty paint layer is simply empty
                 self._warn("layer content could not be reproduced, imported empty")
             return None
-        channels = {}
+        channels, content = {}, {}
         for cid, (val, alpha) in rendered.items():
-            rgb = val if val.ndim == 3 else np.repeat(val[..., None], 3, -1)
-            channels[cid] = self._write_rgb(rgb, "paint_%s_%s" % (tag, cid), alpha)
+            if cid in ("height", "displacement"):
+                # PawPaint reads a painted layer's height from the image as it
+                # is and ignores the image's alpha (measured: a height image
+                # with 0 where nothing is painted gave a pit everywhere outside
+                # the strokes and a cliff along every stroke edge; a project
+                # that is flat in Substance came out covered in bumps). So the
+                # image is 'flat' where nothing is painted and fades to it
+                # with the coverage, and has no alpha.
+                h = painted_height(val, alpha)
+                if float(np.abs(h - 0.5).max()) < 0.5 / 255.0:
+                    continue                    # the strokes paint 'flat': no height at all
+                channels[cid] = self._write_gray(h, "paint_%s_%s" % (tag, cid), bits=16)
+                content[cid] = (_u8(h), np.full(alpha.shape, 255, np.uint8))
+            else:
+                rgb = val if val.ndim == 3 else np.repeat(val[..., None], 3, -1)
+                channels[cid] = self._write_rgb(rgb, "paint_%s_%s" % (tag, cid), alpha)
+                content[cid] = (_u8(val), _u8(alpha))
             if cid in CUSTOM_KINDS:
                 self._custom(cid, CUSTOM_KINDS[cid])
         spec["channels"] = channels
-        return {"kind": "paint", "channels": {c: (_u8(v), _u8(a)) for c, (v, a) in rendered.items()}}
+        if not channels:
+            return None
+        return {"kind": "paint", "channels": content}
 
     def _content_cover(self, act):
         """Brush coverage of one paint/eraser action for the layer's content:
@@ -738,7 +768,8 @@ class MaterialConverter:
         return full[sl], sl
 
     def _render_paint(self, actions):
-        """Render a layer's own actions per channel -> {cid: (value HxWxC or HxW, alpha)}."""
+        """Render a layer's own actions per channel -> {cid: (value HxWxC or HxW, alpha)}.
+        The values are plain colours (not multiplied by the alpha)."""
         if self.mb is None:
             return None
         out = {}
@@ -785,7 +816,8 @@ class MaterialConverter:
                 cov, sl = self._content_cover(act)
                 if cov is not None:
                     for cid in out:
-                        al = out[cid][1]
+                        val, al = out[cid]
+                        val[sl] = val[sl] * ((1 - cov)[..., None] if val.ndim == 3 else (1 - cov))
                         al[sl] = al[sl] * (1 - cov)
                 continue
             elif cls == "DataActionFilterLevels":
@@ -793,19 +825,23 @@ class MaterialConverter:
                 for cid in list(out):
                     flag = next((f for f, (c, _, _) in CHANNEL_MAP.items() if c == cid), 0)
                     if bits & flag:
-                        out[cid] = (P.apply_levels(out[cid][0], act.get("levels") or {}), out[cid][1])
+                        val, al = out[cid]
+                        lv = P.apply_levels(_straight(val, al), act.get("levels") or {}).astype(np.float32)
+                        out[cid] = (lv * (al[..., None] if lv.ndim == 3 else al), al)
                 continue
             elif isinstance(act.get("procedural"), dict) and P.sbsar_name(act["procedural"]) == "blur":
                 # a blur on the layer's content softens its coverage and colours
                 inten = P.tweaks(act["procedural"]).get("intensity", 0.5)
                 for cid in list(out):
                     val, al = out[cid]
+                    val = _straight(val, al)
                     if val.ndim == 3:
                         bl = [P.blur(val[..., k], al, inten, self.res) for k in range(val.shape[2])]
-                        out[cid] = (np.stack([b[0] for b in bl], -1).astype(np.float32), bl[0][1].astype(np.float32))
+                        a2 = bl[0][1].astype(np.float32)
+                        out[cid] = (np.stack([b[0] for b in bl], -1).astype(np.float32) * a2[..., None], a2)
                     else:
                         v2, a2 = P.blur(val, al, inten, self.res)
-                        out[cid] = (v2.astype(np.float32), a2.astype(np.float32))
+                        out[cid] = ((v2 * a2).astype(np.float32), a2.astype(np.float32))
                 continue
             elif isinstance(act.get("procedural"), dict):
                 self._warn("effect '%s' inside a paint layer cannot be reproduced and was skipped"
@@ -829,7 +865,11 @@ class MaterialConverter:
                 vs = v[sl] if "image" in e else v
                 val[sl] += (vs - val[sl]) * kk
                 al[sl] += (1 - al[sl]) * k
-        return out or None
+        # Laying strokes over each other from nothing leaves 'colour x coverage'
+        # in `val`. The image PawPaint gets has the coverage as its alpha, so
+        # the colour must be the plain one; written as it was, soft stroke
+        # edges came out darker than painted (and a painted height lower).
+        return {cid: (_straight(val, al), al) for cid, (val, al) in out.items()} or None
 
     def _walk(self, items, parent_idx, path):
         for L in items:

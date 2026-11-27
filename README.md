@@ -108,6 +108,9 @@ size out for you:
 Closing other programs that use the graphics card (Substance, games,
 browsers) frees video memory.
 
+**Height.** Untick *Height (bumps)* in the plugin to import a project without
+any height: no layer then changes the height channel.
+
 **Own Substance?** Install the optional Substance plugin (see
 `substance_plugin/README.md`) and choose **File › Export for PawPaint...**,
 then convert as usual. Every layer then comes over exactly, including blur,
