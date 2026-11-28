@@ -387,7 +387,8 @@ def _convert_sets(proj, geo, scene, mats, sizes, out_dir, entries, warnings, lay
             if export:
                 ts = next((t_ for t_ in export.get("textureSets", []) if t_.get("name") == name), None)
                 if ts:
-                    exact_specs = X.build_specs(export_dir, ts, mc.mapdir, res, mc._warn)
+                    exact_specs = X.build_specs(export_dir, ts, mc.mapdir, res, mc._warn,
+                                                mc.normal_convention, mc.baked_map("normal"))
             manifest = mc.convert(include_layers=layers, include_flat=flat, include_baked=baked, exact=exact_specs)
             score = None
             if check and layers and exact_specs is None and mc.mb is not None and mc.cache_albedo is not None:

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1 – 2026-11-27
+Fixes the optional Substance plugin (PawPaint Exporter, now 0.3.0), tested end to end for the first time. If you use it, update it, **export again**, then convert and import again. Nothing changes for conversions without it.
+
+- **Roughness, metallic and emission were missing** with Substance 12.2 ("2026"). That version gives those channels new names, and the plugin skipped them without a word.
+- **Height came in wrong** (bumps everywhere a layer was). Substance's "black" export background is flat height, not the lowest, which the converter didn't know.
+- **Normals came in wrong or flat.** A layer's flat normal covered the baked normal map in PawPaint, and in projects that use DirectX normals the colours were mixed up completely. Flat layer normals are now left out and the others combined with the baked normal map, as Substance shows them.
+- **Layer and folder opacities counted twice.** The plugin now exports each layer at 100 % and records every channel's blend mode and opacity, which PawPaint gets back. A layer at 50 % opacity comes in at 50 % and shows like in Substance.
+- Height exports in 16 bits again (it was 8).
+- Measured in PawPaint 1.28 on two test projects: height from 0 % to 100 % of texels matching Substance, normals from 0 to 75 % to 96 to 100 %.
+
 ## 0.7.0 – 2026-11-27
 Uses what PawPaint 1.28 added for plugins. Update both parts: the zip has the new exe and the new plugin (0.7.0; the exe offers to install it). Everything still works with older PawPaint versions, the way it did before.
 
