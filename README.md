@@ -48,6 +48,10 @@ binary files.
    in. Click **Import**.
 3. When it says *Done*, use **File › Save As**. Plugins can't save projects.
 
+**After updating to a new version, redo every step:** export again if you use
+the optional Substance plugin, convert the `.spp` again, and import again. An
+old export or conversion keeps the old version's result.
+
 **What you get, per texture set**
 - **Substance Result**: a paint layer on top with every channel exactly as
   Substance showed it. Hide it to work with the layers below.

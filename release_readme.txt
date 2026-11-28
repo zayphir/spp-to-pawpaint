@@ -16,6 +16,11 @@ USE (no Substance needed)
      Plugins > Substance Importer: your conversion is already filled in. Click Import.
   3. When it says Done: File > Save As.
 
+AFTER UPDATING TO A NEW VERSION
+  Redo every step: export again if you use the optional Substance plugin, convert
+  the .spp again, and import again. An old export or conversion keeps the old
+  version's result.
+
 WHAT YOU GET, PER MATERIAL
   - "Substance Result" on top: an exact copy of what Substance showed. Hide it to edit
     the rebuilt layers underneath.
